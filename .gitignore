@@ -1,0 +1,14 @@
+.venv/
+__pycache__/
+*.pyc
+
+# Assignment-generated files
+predictions.txt
+weights.txt
+bestlambda.txt
+crossvalidation_errors.txt
+*.pkl
+*.npy
+
+# Local datasets
+data/*
