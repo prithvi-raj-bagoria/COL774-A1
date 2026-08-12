@@ -202,12 +202,7 @@ def extract_features_from_array(X_raw, feature_columns):
 
     # --- 3. Cross-Modality Motion Correlation ---
     bvp_downsampled = bvp[:, ::2]  # Match 32Hz ACC sample size
-    add_feature(
-        features, 
-        names, 
-        row_cross_correlation(bvp_downsampled, acc_sq), 
-        "bvp_acc_cross_corr"
-    )
+    
 
     # --- 4. EDA Features ---
     eda = X_raw[:, eda_idx]
@@ -256,7 +251,10 @@ def main():
     print("\nFitting RidgeCV model (Fast Generalized Cross-Validation)...")
     model = make_pipeline(
         StandardScaler(), 
-        RidgeCV(alphas=ALPHAS)  # Fast closed-form Leave-One-Out CV
+        RidgeCV(
+        alphas=ALPHAS,
+        scoring="neg_mean_absolute_error"
+    )
     )
     model.fit(Z_train, y_train)
 
