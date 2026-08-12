@@ -215,38 +215,7 @@ def add_basic_features(features, names, x, prefix):
         row_lag1_autocorrelation(x),
         f"{prefix}_lag1_autocorr"
     )
-        # Additional temporal features
-    if prefix == "bvp":
-        add_feature(
-            features,
-            names,
-            row_lag1_autocorrelation(x),
-            f"{prefix}_lag1_autocorr_extra"
-        )
 
-        d2 = np.diff(x, n=2, axis=1)
-
-        add_feature(
-            features,
-            names,
-            np.mean(np.abs(d2), axis=1),
-            f"{prefix}_second_diff_abs_mean_extra"
-        )
-
-        add_feature(
-            features,
-            names,
-            np.std(d2, axis=1),
-            f"{prefix}_second_diff_std_extra"
-        )
-
-        add_feature(
-            features,
-            names,
-            np.percentile(x, 90, axis=1)
-            - np.percentile(x, 10, axis=1),
-            f"{prefix}_p90_p10_extra"
-        )
 
 def block_features(
     x,

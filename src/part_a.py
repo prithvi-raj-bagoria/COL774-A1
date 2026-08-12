@@ -24,18 +24,6 @@ def main():
     # ---------------------------------------------------------
     feature_columns = train.columns[:-1]
 
-    if train.columns[-1] != "hr":
-        raise ValueError(
-            f"Expected final training column to be 'hr', "
-            f"found '{train.columns[-1]}'"
-        )
-
-    if test.columns[-1] != "hr":
-        raise ValueError(
-            f"Expected final test column to be 'hr' in the supplied "
-            f"dataset, found '{test.columns[-1]}'"
-        )
-
     # Use exactly the 1640 feature columns, in their original order.
     X_train = train[feature_columns].to_numpy(dtype=float)
     y_train = train["hr"].to_numpy(dtype=float)

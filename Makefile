@@ -7,95 +7,81 @@ REG := data/regularization.txt
 
 SRC := src
 
+PRED_A := predictions_a.txt
+WEIGHTS_A := weights_a.txt
+
+PRED_B := predictions_b.txt
+WEIGHTS_B := weights_b.txt
+BEST_LAMBDA := bestlambda.txt
+CV_ERRORS := crossvalidation_errors.txt
+
+PRED_C := predictions_c.txt
+
+
 .PHONY: help test run-a run-b run-c run-all \
         evaluate-a evaluate-b evaluate-c evaluate \
-        clean clean-predictions clean-cache
+        clean clean-cache
+
 
 help:
 	@echo "COL774 Assignment 1"
 	@echo
-	@echo "Usage:"
-	@echo "  make test          - syntax-check Python files"
-	@echo "  make run-a         - run Part (a)"
-	@echo "  make run-b         - run Part (b)"
-	@echo "  make run-c         - run Part (c)"
-	@echo "  make run-all       - run Parts (a), (b), (c)"
-	@echo "  make evaluate-a    - evaluate Part (a)"
-	@echo "  make evaluate-b    - evaluate Part (b)"
-	@echo "  make evaluate-c    - evaluate Part (c)"
-	@echo "  make evaluate      - evaluate all existing predictions"
-	@echo "  make clean         - remove generated outputs"
-	@echo "  make clean-cache   - remove Python cache files"
+	@echo "make test        - syntax-check Python files"
+	@echo "make run-a       - run Part (a)"
+	@echo "make run-b       - run Part (b)"
+	@echo "make run-c       - run Part (c)"
+	@echo "make run-all     - run Parts (a), (b), (c)"
+	@echo "make evaluate-a  - evaluate Part (a)"
+	@echo "make evaluate-b  - evaluate Part (b)"
+	@echo "make evaluate-c  - evaluate Part (c)"
+	@echo "make evaluate    - evaluate all existing predictions"
+	@echo "make clean       - remove generated output files"
+	@echo "make clean-cache - remove Python cache files"
 
 
 test:
-	$(PYTHON) -m py_compile \
-		$(SRC)/part_a.py \
-		$(SRC)/part_b.py \
-		$(SRC)/part_c.py \
-		$(SRC)/run_experiments.py
+	$(PYTHON) -m py_compile $(SRC)/part_a.py $(SRC)/part_b.py $(SRC)/part_c.py $(SRC)/run_experiments.py $(SRC)/evaluate.py
+
 
 run-a:
 	$(PYTHON) $(SRC)/run_experiments.py a
 
+
 run-b:
 	$(PYTHON) $(SRC)/run_experiments.py b
 
+
 run-c:
 	$(PYTHON) $(SRC)/run_experiments.py c
+
 
 run-all:
 	$(PYTHON) $(SRC)/run_experiments.py all
 
 
 evaluate-a:
-	$(PYTHON) $(SRC)/evaluate.py \
-		$(TEST) \
-		predictions_a.txt \
-		"Part A - OLS"
+	$(PYTHON) $(SRC)/evaluate.py $(TEST) $(PRED_A)
 
 
 evaluate-b:
-	$(PYTHON) $(SRC)/evaluate.py \
-		$(TEST) \
-		predictions_b.txt \
-		"Part B - Ridge"
+	$(PYTHON) $(SRC)/evaluate.py $(TEST) $(PRED_B)
 
 
 evaluate-c:
-	$(PYTHON) $(SRC)/evaluate.py \
-		$(TEST) \
-		predictions_c.txt \
-		"Part C - Feature Engineering"
+	$(PYTHON) $(SRC)/evaluate.py $(TEST) $(PRED_C)
 
 
 evaluate:
-	$(PYTHON) $(SRC)/evaluate.py \
-		$(TEST) \
-		predictions_a.txt \
-		predictions_b.txt \
-		predictions_c.txt
-
-
-clean-predictions:
-	rm -f \
-		predictions_a.txt \
-		predictions_b.txt \
-		predictions_c.txt
+	$(PYTHON) $(SRC)/evaluate.py $(TEST) $(PRED_A) $(PRED_B) $(PRED_C)
 
 
 clean:
-	rm -f \
-		predictions_a.txt \
-		predictions_b.txt \
-		predictions_c.txt \
-		weights_a.txt \
-		weights_b.txt \
-		bestlambda.txt \
-		crossvalidation_errors.txt
+	rm -f $(PRED_A) $(WEIGHTS_A)
+	rm -f $(PRED_B) $(WEIGHTS_B)
+	rm -f $(BEST_LAMBDA) $(CV_ERRORS)
+	rm -f $(PRED_C)
 
 
 clean-cache:
 	find . -type d -name "__pycache__" -prune -exec rm -rf {} +
 	find . -type f -name "*.pyc" -delete
-
