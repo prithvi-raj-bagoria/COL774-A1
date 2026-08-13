@@ -1,87 +1,150 @@
 PYTHON := .venv/bin/python
 
 TRAIN := data/e4_hr_train_downsampled.csv
-TEST := data/e4_hr_test_downsampled.csv
+TEST  := data/e4_hr_test_downsampled.csv
+
 FOLDS := data/train_5fold.txt
-REG := data/regularization.txt
+REGULARIZATION := data/regularization.txt
 
 SRC := src
-
-PRED_A := predictions_a.txt
-WEIGHTS_A := weights_a.txt
-
-PRED_B := predictions_b.txt
-WEIGHTS_B := weights_b.txt
-BEST_LAMBDA := bestlambda.txt
-CV_ERRORS := crossvalidation_errors.txt
-
-PRED_C := predictions_c.txt
+EVAL := evaluation
 
 
-.PHONY: help test run-a run-b run-c run-all \
-        evaluate-a evaluate-b evaluate-c evaluate \
-        clean clean-cache
+# ============================================================
+# Part (a) — Official evaluation
+# ============================================================
+
+.PHONY: eval-a
+eval-a:
+	$(PYTHON) $(EVAL)/eval_a.py \
+		$(SRC)/part_a.py \
+		$(TRAIN) \
+		$(TEST)
+
+.PHONY: check-a
+check-a: eval-a
 
 
+# ============================================================
+# Part (b) — Official evaluation
+# ============================================================
+
+.PHONY: eval-b
+eval-b:
+	$(PYTHON) $(EVAL)/eval_b.py \
+		$(SRC)/part_b.py \
+		$(TRAIN) \
+		$(TEST) \
+		$(FOLDS) \
+		$(REGULARIZATION)
+
+.PHONY: check-b
+check-b: eval-b
+
+
+# ============================================================
+# Part (c) — Official evaluation
+# ============================================================
+
+.PHONY: eval-c
+eval-c:
+	$(PYTHON) $(EVAL)/eval_c.py \
+		$(SRC)/part_c.py \
+		$(TRAIN) \
+		$(TEST)
+
+.PHONY: check-c
+check-c: eval-c
+
+
+# ============================================================
+# Part (d)
+# ============================================================
+
+# Set these after confirming the exact Part (d) evaluator interface.
+D_MODEL := model_d.pkl
+D_FEATURES := features_d.npy
+D_LABELS := data/public_test
+
+.PHONY: eval-d
+eval-d:
+	$(PYTHON) $(EVAL)/eval_d.py \
+		--model $(D_MODEL) \
+		--features $(D_FEATURES) \
+		--labels $(D_LABELS)
+
+.PHONY: check-d
+check-d: eval-d
+
+
+# ============================================================
+# Evaluate all
+# ============================================================
+
+.PHONY: evaluate
+evaluate: eval-a eval-b eval-c
+	@echo ""
+	@echo "=========================================="
+	@echo "All CSV-based evaluations complete."
+	@echo "=========================================="
+
+
+# ============================================================
+# Help
+# ============================================================
+
+.PHONY: help
 help:
-	@echo "COL774 Assignment 1"
-	@echo
-	@echo "make test        - syntax-check Python files"
-	@echo "make run-a       - run Part (a)"
-	@echo "make run-b       - run Part (b)"
-	@echo "make run-c       - run Part (c)"
-	@echo "make run-all     - run Parts (a), (b), (c)"
-	@echo "make evaluate-a  - evaluate Part (a)"
-	@echo "make evaluate-b  - evaluate Part (b)"
-	@echo "make evaluate-c  - evaluate Part (c)"
-	@echo "make evaluate    - evaluate all existing predictions"
-	@echo "make clean       - remove generated output files"
-	@echo "make clean-cache - remove Python cache files"
+	@echo "Available commands:"
+	@echo ""
+	@echo "  make eval-a    Official Part (a) evaluation"
+	@echo "  make eval-b    Official Part (b) evaluation"
+	@echo "  make eval-c    Official Part (c) evaluation"
+	@echo "  make eval-d    Official Part (d) evaluation"
+	@echo ""
+	@echo "  make check-a   Same as eval-a"
+	@echo "  make check-b   Same as eval-b"
+	@echo "  make check-c   Same as eval-c"
+	@echo "  make check-d   Same as eval-d"
+	@echo ""
+	@echo "  make evaluate  Evaluate Parts A, B and C"
 
 
-test:
-	$(PYTHON) -m py_compile $(SRC)/part_a.py $(SRC)/part_b.py $(SRC)/part_c.py $(SRC)/run_experiments.py $(SRC)/evaluate.py
+# ============================================================
+# Clean generated files
+# ============================================================
 
-
-run-a:
-	$(PYTHON) $(SRC)/run_experiments.py a
-
-
-run-b:
-	$(PYTHON) $(SRC)/run_experiments.py b
-
-
-run-c:
-	$(PYTHON) $(SRC)/run_experiments.py c
-
-
-run-all:
-	$(PYTHON) $(SRC)/run_experiments.py all
-
-
-evaluate-a:
-	$(PYTHON) $(SRC)/evaluate.py $(TEST) $(PRED_A)
-
-
-evaluate-b:
-	$(PYTHON) $(SRC)/evaluate.py $(TEST) $(PRED_B)
-
-
-evaluate-c:
-	$(PYTHON) $(SRC)/evaluate.py $(TEST) $(PRED_C)
-
-
-evaluate:
-	$(PYTHON) $(SRC)/evaluate.py $(TEST) $(PRED_A) $(PRED_B) $(PRED_C)
-
-
+.PHONY: clean
 clean:
-	rm -f $(PRED_A) $(WEIGHTS_A)
-	rm -f $(PRED_B) $(WEIGHTS_B)
-	rm -f $(BEST_LAMBDA) $(CV_ERRORS)
-	rm -f $(PRED_C)
+	@echo "Cleaning generated files..."
 
+	# Prediction files
+	find . -type f \( \
+		-name "predictions*.txt" \
+		-o -name "predictions*.csv" \
+	\) -delete
 
-clean-cache:
+	# Generated model / feature artifacts
+	find . -type f \( \
+		-name "*.pkl" \
+		-o -name "*.npy" \
+		-o -name "*.joblib" \
+	\) -delete
+
+	# Assignment-generated text files
+	find . -type f \( \
+		-name "weights.txt" \
+		-o -name "bestlambda.txt" \
+		-o -name "crossvalidation_errors.txt" \
+	\) -delete
+
+	# Python cache
 	find . -type d -name "__pycache__" -prune -exec rm -rf {} +
+
+	# Pytest cache, if created
+	find . -type d -name ".pytest_cache" -prune -exec rm -rf {} +
+
+	# Misc generated Python bytecode
 	find . -type f -name "*.pyc" -delete
+
+	@echo "Clean complete."

@@ -1,14 +1,17 @@
 .venv/
 __pycache__/
 *.pyc
+.pytest_cache/
 
 # Assignment-generated files
-predictions.txt
+predictions*.txt
+predictions*.csv
 weights.txt
 bestlambda.txt
 crossvalidation_errors.txt
 *.pkl
 *.npy
+*.joblib
 
 # Local datasets
 data/*
