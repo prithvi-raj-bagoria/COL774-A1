@@ -221,7 +221,7 @@ def main():
     Z_val_scaled = scaler_inner.transform(Z_val)
 
     # Grid search parameters over LinearSVR
-    c_candidates = [0.01, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0]
+    c_candidates = [0.01, 0.1,0.5, 1.0, 2.0]
     eps_candidates = [0.0, 0.01]
 
     print("\n--- Tuning LinearSVR Hyperparameters (C & Epsilon) ---")
