@@ -242,45 +242,21 @@ def add_feature(
     names.append(name)
 
 
-def add_percentiles(
-    features,
-    names,
-    x,
-    prefix
-):
-    p10, p25, p75, p90 = np.percentile(
-        x,
-        [10, 25, 75, 90],
-        axis=1
-    )
+def add_percentiles(features, names, x, prefix):
+    # Sort each row once instead of calculating percentiles 4 separate times
+    x_sorted = np.sort(x, axis=1)
+    n = x.shape[1]
+    
+    # Pre-compute target indices for 10%, 25%, 75%, and 90%
+    idx_10 = int(0.10 * (n - 1))
+    idx_25 = int(0.25 * (n - 1))
+    idx_75 = int(0.75 * (n - 1))
+    idx_90 = int(0.90 * (n - 1))
 
-    add_feature(
-        features,
-        names,
-        p10,
-        f"{prefix}_p10"
-    )
-
-    add_feature(
-        features,
-        names,
-        p25,
-        f"{prefix}_p25"
-    )
-
-    add_feature(
-        features,
-        names,
-        p75,
-        f"{prefix}_p75"
-    )
-
-    add_feature(
-        features,
-        names,
-        p90,
-        f"{prefix}_p90"
-    )
+    add_feature(features, names, x_sorted[:, idx_10], f"{prefix}_p10")
+    add_feature(features, names, x_sorted[:, idx_25], f"{prefix}_p25")
+    add_feature(features, names, x_sorted[:, idx_75], f"{prefix}_p75")
+    add_feature(features, names, x_sorted[:, idx_90], f"{prefix}_p90")
 
 
 def add_basic_features(
@@ -994,24 +970,12 @@ def extract_features(
     )
 
     # Movement burstiness.
-    add_feature(
-        features,
-        names,
-        (
-            np.percentile(
-                acc_sq,
-                90,
-                axis=1
-            )
-            -
-            np.percentile(
-                acc_sq,
-                10,
-                axis=1
-            )
-        ),
-        "acc_sq_burstiness"
-    )
+    acc_sq_sorted = np.sort(acc_sq, axis=1)
+    idx_10 = int(0.10 * (acc_sq.shape[1] - 1))
+    idx_90 = int(0.90 * (acc_sq.shape[1] - 1))
+    burstiness = acc_sq_sorted[:, idx_90] - acc_sq_sorted[:, idx_10]
+
+    add_feature(features, names, burstiness, "acc_sq_burstiness")
 
     # Rapid changes in movement.
     second_diff = np.diff(
