@@ -2,9 +2,8 @@ import sys
 import numpy as np
 import pandas as pd
 
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import RobustScaler
 from sklearn.model_selection import train_test_split
-from sklearn.linear_model import HuberRegressor, Ridge
 from sklearn.svm import LinearSVR
 
 # ============================================================
@@ -152,6 +151,9 @@ def extract_features(X_raw, feature_columns):
     add_deep_features(features, names, eda, "eda", [1, 2, 4])
     add_temporal_blocks(features, names, eda, "eda")
 
+    # Non-linear log transform for skewed EDA intensity
+    add_feat(features, names, np.log1p(np.maximum(0, row_mean(eda))), "eda_log_mean")
+
     # 4. Cross-Modal Interactions
     acc_rms_val = row_rms(acc_sq)
     eda_mean_val = row_mean(eda)
@@ -172,7 +174,7 @@ def extract_features(X_raw, feature_columns):
     return Z, names
 
 # ============================================================
-# Evaluation Metric Helpers
+# Metric Helpers
 # ============================================================
 
 def calc_nmae(y_true, y_pred):
@@ -213,56 +215,60 @@ def main():
     # Inner Validation Split (80% Train, 20% Val)
     Z_tr, Z_val, y_tr, y_val = train_test_split(Z_train, y_train, test_size=0.20, random_state=42)
 
-    scaler_inner = StandardScaler()
+    # Use RobustScaler to handle biosignal artifacts smoothly
+    scaler_inner = RobustScaler()
     Z_tr_scaled = scaler_inner.fit_transform(Z_tr)
     Z_val_scaled = scaler_inner.transform(Z_val)
 
-    # Candidates for comparison
-    candidate_models = {
-        "Ridge (L2 Loss)": Ridge(alpha=100.0),
-        "LinearSVR (L1 Loss)": LinearSVR(epsilon=0.0, C=1.0, max_iter=3000, random_state=42),
-        "HuberRegressor (Hybrid)": HuberRegressor(alpha=1e-4, epsilon=1.35, max_iter=2000)
-    }
+    # Grid search parameters over LinearSVR
+    c_candidates = [0.01, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0]
+    eps_candidates = [0.0, 0.01]
 
-    print("\n--- Running 3-Way Model Evaluation ---")
-    best_model_name = None
+    print("\n--- Tuning LinearSVR Hyperparameters (C & Epsilon) ---")
     best_nmae = float("inf")
-    best_model_obj = None
+    best_c = 1.0
+    best_eps = 0.0
 
-    for name, model in candidate_models.items():
-        model.fit(Z_tr_scaled, y_tr)
-        val_preds = model.predict(Z_val_scaled)
-        
-        nmae = calc_nmae(y_val, val_preds)
-        nmse = calc_nmse(y_val, val_preds)
-        
-        print(f"[{name}] -> Inner Val NMAE: {nmae:.5f} | Inner Val NMSE: {nmse:.5f}")
-        
-        if nmae < best_nmae:
-            best_nmae = nmae
-            best_model_name = name
-            best_model_obj = model
+    for c_val in c_candidates:
+        for eps_val in eps_candidates:
+            model = LinearSVR(
+                epsilon=eps_val,
+                C=c_val,
+                max_iter=4000,
+                random_state=42,
+                dual="auto"
+            )
+            model.fit(Z_tr_scaled, y_tr)
+            preds = model.predict(Z_val_scaled)
+            
+            nmae = calc_nmae(y_val, preds)
+            nmse = calc_nmse(y_val, preds)
+            
+            print(f"[C={c_val:<4} | eps={eps_val:<4}] -> Val NMAE: {nmae:.5f} | Val NMSE: {nmse:.5f}")
+            
+            if nmae < best_nmae:
+                best_nmae = nmae
+                best_c = c_val
+                best_eps = eps_val
 
-    print(f"\nWinning Model Selected: {best_model_name} (NMAE = {best_nmae:.5f})")
+    print(f"\nOptimal LinearSVR Found: C={best_c}, epsilon={best_eps} (Best NMAE = {best_nmae:.5f})")
 
-    # Retrain the winning model architecture on 100% of training data
-    print("\nScaling full dataset and retraining winner...")
-    scaler_full = StandardScaler()
+    print("\nScaling full dataset with RobustScaler and retraining optimal LinearSVR...")
+    scaler_full = RobustScaler()
     Z_train_scaled = scaler_full.fit_transform(Z_train)
     del Z_train
 
-    # Re-instantiate winning model type
-    if "Ridge" in best_model_name:
-        final_model = Ridge(alpha=100.0)
-    elif "LinearSVR" in best_model_name:
-        final_model = LinearSVR(epsilon=0.0, C=1.0, max_iter=3000, random_state=42)
-    else:
-        final_model = HuberRegressor(alpha=1e-4, epsilon=1.35, max_iter=2000)
-
+    final_model = LinearSVR(
+        epsilon=best_eps,
+        C=best_c,
+        max_iter=5000,
+        random_state=42,
+        dual="auto"
+    )
     final_model.fit(Z_train_scaled, y_train)
     del Z_train_scaled, y_train
 
-    print("Loading test data and generating predictions...")
+    print("Loading test data and writing predictions...")
     test_df = pd.read_csv(test_path)
     X_test_raw = test_df[feature_columns].to_numpy(dtype=np.float32)
     del test_df
@@ -275,7 +281,7 @@ def main():
 
     predictions = final_model.predict(Z_test_scaled)
     np.savetxt(predictions_path, predictions, fmt="%.10f")
-    print(f"Predictions successfully saved to {predictions_path}")
+    print(f"Done! Optimized predictions saved to {predictions_path}")
 
 if __name__ == "__main__":
     main()
