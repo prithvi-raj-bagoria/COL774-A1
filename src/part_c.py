@@ -136,16 +136,13 @@ def add_block_summary(features, names, x, block_size, prefix):
 
 
 # ============================================================
-# NEW PHYSICS/MATH FEATURES (Upgraded for Sub-BPM Precision)
+# SPECTRAL FEATURES
 # ============================================================
 
 def add_spectral_features(features, names, bvp, acc_sq):
-    """Concept 1 & 3: High-Resolution Windowed Zero-Padded FFT"""
-    # Apply Hanning window to prevent frequency leakage at the start/end of 10s blocks
     bvp_w = bvp * np.hanning(bvp.shape[1])
     acc_w = acc_sq * np.hanning(acc_sq.shape[1])
     
-    # Pad signals to 10x length for pure numpy frequency interpolation (0.01 Hz resolution)
     bvp_pad_len = bvp.shape[1] * 10
     acc_pad_len = acc_sq.shape[1] * 10
 
@@ -154,18 +151,15 @@ def add_spectral_features(features, names, bvp, acc_sq):
     bvp_power = bvp_fft ** 2
     bvp_freqs = np.fft.rfftfreq(bvp_pad_len, d=1.0/64.0)
     
-    # Mask frequencies typical for heart rate (0.7 Hz to 3.0 Hz -> 42-180 BPM)
     bvp_mask = (bvp_freqs >= 0.7) & (bvp_freqs <= 3.0)
     bvp_hr_fft = bvp_fft[:, bvp_mask]
     bvp_hr_power = bvp_power[:, bvp_mask]
     bvp_hr_freqs = bvp_freqs[bvp_mask]
     
-    # Extract dominant BVP frequency peak with ~0.6 BPM precision
     bvp_peak_idx = np.argmax(bvp_hr_fft, axis=1)
     bvp_peak_bpm = bvp_hr_freqs[bvp_peak_idx] * 60.0
     add_feature(features, names, bvp_peak_bpm, "bvp_spectral_peak_bpm_fine")
     
-    # Calculate Spectral Entropy (Signal chaos)
     p_bvp = bvp_hr_power / (np.sum(bvp_hr_power, axis=1, keepdims=True) + 1e-10)
     bvp_entropy = -np.sum(p_bvp * np.log2(p_bvp + 1e-10), axis=1)
     add_feature(features, names, bvp_entropy, "bvp_spectral_entropy")
@@ -178,30 +172,24 @@ def add_spectral_features(features, names, bvp, acc_sq):
     acc_hr_fft = acc_fft[:, acc_mask]
     acc_hr_freqs = acc_freqs[acc_mask]
     
-    # Extract dominant Movement frequency peak
     acc_peak_idx = np.argmax(acc_hr_fft, axis=1)
     acc_peak_bpm = acc_hr_freqs[acc_peak_idx] * 60.0
     add_feature(features, names, acc_peak_bpm, "acc_spectral_peak_bpm_fine")
     
-    # 3. Spectral Orthogonality
     add_feature(features, names, np.abs(bvp_peak_bpm - acc_peak_bpm), "bvp_acc_spectral_diff_fine")
 
 def add_snr_features(features, names, bvp, acc_sq, bvp_bpm_estimate):
-    """Concept 2: Signal-to-Noise Ratio (SNR) and Confidence Gating"""
     acc_var = np.var(acc_sq, axis=1)
     bvp_var = np.var(bvp, axis=1)
     
-    # Power ratio of biological signal to motion artifact
     snr = bvp_var / (acc_var + 1e-5)
     add_feature(features, names, snr, "bvp_acc_snr")
     
-    # Mathematical gating: Force the HR estimate down if motion variance is dangerously high
     confidence = 1.0 / (1.0 + acc_var)
     gated_bpm = bvp_bpm_estimate * confidence
     add_feature(features, names, gated_bpm, "bvp_bpm_gated_by_acc")
 
 def add_eda_derivatives(features, names, eda):
-    """Concept 4: Physiological Autonomic Coupling via EDA Kinematics"""
     eda_vel = np.diff(eda, axis=1)
     eda_acc = np.diff(eda_vel, axis=1)
     
@@ -298,18 +286,12 @@ def extract_features(X_raw, feature_columns):
     bvp = X_raw[:, bvp_idx]
     eda = X_raw[:, eda_idx]
 
-    # ========================================================
-    # 1. BVP
-    # ========================================================
     cardiac_lags = [16, 20, 24, 28, 32, 38, 44, 50, 58, 66, 76, 86, 96]
     add_deep_features(features, names, bvp, "bvp", cardiac_lags)
     add_block_summary(features, names, bvp, 64, "bvp")
     add_vpg_features(features, names, bvp)
     add_temporal_position_features(features, names, bvp, "bvp")
 
-    # ========================================================
-    # 2. ACCELEROMETER
-    # ========================================================
     add_basic_features(features, names, acc_x, "acc_x")
     add_basic_features(features, names, acc_y, "acc_y")
     add_basic_features(features, names, acc_z, "acc_z")
@@ -325,7 +307,6 @@ def extract_features(X_raw, feature_columns):
     jerk = np.diff(acc_sq, axis=1)
     add_basic_features(features, names, jerk, "jerk")
 
-    # Fast burstiness computation
     acc_sq_sorted = np.sort(acc_sq, axis=1)
     idx_10 = int(0.10 * (acc_sq.shape[1] - 1))
     idx_90 = int(0.90 * (acc_sq.shape[1] - 1))
@@ -337,16 +318,10 @@ def extract_features(X_raw, feature_columns):
     add_feature(features, names, np.std(second_diff, axis=1), "acc_sq_second_diff_std")
     add_temporal_position_features(features, names, acc_sq, "acc_sq")
 
-    # ========================================================
-    # 3. EDA
-    # ========================================================
     add_deep_features(features, names, eda, "eda", [1, 2, 4])
     add_block_summary(features, names, eda, 4, "eda")
     add_temporal_position_features(features, names, eda, "eda")
 
-    # ========================================================
-    # 4. Physiologically Motivated Interactions & NEW FEATURES
-    # ========================================================
     bvp_bpm_val = vpg_bpm(bvp)
     acc_rms_val = row_rms(acc_sq)
     eda_mean_val = row_mean(eda)
@@ -356,16 +331,10 @@ def extract_features(X_raw, feature_columns):
     add_feature(features, names, bvp_bpm_val * eda_mean_val, "interaction_bpm_eda")
     add_feature(features, names, acc_rms_val * eda_mean_val, "interaction_motion_eda")
 
-    # --------------------------------------------------------
-    # Math/Physics Concepts Injected (Upgraded)
-    # --------------------------------------------------------
     add_spectral_features(features, names, bvp, acc_sq)
     add_snr_features(features, names, bvp, acc_sq, bvp_bpm_val)
     add_eda_derivatives(features, names, eda)
 
-    # --------------------------------------------------------
-    # Final matrix compilation
-    # --------------------------------------------------------
     Z = np.column_stack(features).astype(np.float32)
 
     if not np.all(np.isfinite(Z)):
@@ -428,16 +397,25 @@ def main():
     print("Huber model fitted successfully.")
     print(f"Iterations used = {model.n_iter_}")
 
+    # ========================================================
+    # INSPECT COEFFICIENTS TO SEE WHAT THE MODEL USES
+    # ========================================================
+    coef_importance = sorted(zip(feature_names, model.coef_), key=lambda x: abs(x[1]), reverse=True)
+    print("\n--- TOP 15 FEATURES BY ABSOLUTE COEFFICIENT WEIGHT ---")
+    for fname, fcoef in coef_importance[:15]:
+        print(f"  {fname}: {fcoef:.4f}")
+    print("------------------------------------------------------\n")
+
     del Z_train_scaled
     del y_train
 
-    print("\nLoading test CSV...")
+    print("Loading test CSV...")
     test_df = pd.read_csv(test_path)
     X_test_raw = test_df[feature_columns].to_numpy(dtype=np.float32)
     del test_df
 
     print("Creating test engineered features...")
-    Z_test, test_feature_names = extract_features(X_test_raw, feature_columns)
+    Z_test, _ = extract_features(X_test_raw, feature_columns)
     del X_test_raw
 
     Z_test_scaled = scaler.transform(Z_test)
