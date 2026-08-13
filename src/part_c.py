@@ -3,15 +3,14 @@ import numpy as np
 import pandas as pd
 
 from sklearn.preprocessing import StandardScaler
-from sklearn.linear_model import HuberRegressor
+from sklearn.model_selection import train_test_split
+from sklearn.linear_model import HuberRegressor, Ridge
+from sklearn.svm import LinearSVR
 
 # ============================================================
 # Configuration & Constants
 # ============================================================
 
-HUBER_ALPHA = 1e-4
-HUBER_EPSILON = 1.35
-HUBER_MAX_ITER = 2000
 EXPECTED_RAW_FEATURES = 1640
 
 # ============================================================
@@ -112,10 +111,6 @@ def add_temporal_blocks(features, names, x, prefix, n_blocks=4):
         add_feat(features, names, row_std(blk), f"{prefix}_t{k+1}_std")
         add_feat(features, names, row_slope(blk), f"{prefix}_t{k+1}_slope")
 
-# ============================================================
-# Complete Feature Extractor
-# ============================================================
-
 def extract_features(X_raw, feature_columns):
     features, names = [], []
 
@@ -177,6 +172,20 @@ def extract_features(X_raw, feature_columns):
     return Z, names
 
 # ============================================================
+# Evaluation Metric Helpers
+# ============================================================
+
+def calc_nmae(y_true, y_pred):
+    mae = np.mean(np.abs(y_true - y_pred))
+    denom = np.mean(np.abs(y_true - np.mean(y_true)))
+    return mae / (denom + 1e-10)
+
+def calc_nmse(y_true, y_pred):
+    mse = np.mean((y_true - y_pred) ** 2)
+    var = np.var(y_true)
+    return mse / (var + 1e-10)
+
+# ============================================================
 # Main Script Execution
 # ============================================================
 
@@ -197,26 +206,63 @@ def main():
     X_train_raw = train_df[feature_columns].to_numpy(dtype=np.float32)
     del train_df
 
-    print("Extracting features...")
+    print("Extracting domain-engineered features...")
     Z_train, _ = extract_features(X_train_raw, feature_columns)
     del X_train_raw
 
-    print("Scaling features...")
-    scaler = StandardScaler()
-    Z_train_scaled = scaler.fit_transform(Z_train)
+    # Inner Validation Split (80% Train, 20% Val)
+    Z_tr, Z_val, y_tr, y_val = train_test_split(Z_train, y_train, test_size=0.20, random_state=42)
+
+    scaler_inner = StandardScaler()
+    Z_tr_scaled = scaler_inner.fit_transform(Z_tr)
+    Z_val_scaled = scaler_inner.transform(Z_val)
+
+    # Candidates for comparison
+    candidate_models = {
+        "Ridge (L2 Loss)": Ridge(alpha=100.0),
+        "LinearSVR (L1 Loss)": LinearSVR(epsilon=0.0, C=1.0, max_iter=3000, random_state=42),
+        "HuberRegressor (Hybrid)": HuberRegressor(alpha=1e-4, epsilon=1.35, max_iter=2000)
+    }
+
+    print("\n--- Running 3-Way Model Evaluation ---")
+    best_model_name = None
+    best_nmae = float("inf")
+    best_model_obj = None
+
+    for name, model in candidate_models.items():
+        model.fit(Z_tr_scaled, y_tr)
+        val_preds = model.predict(Z_val_scaled)
+        
+        nmae = calc_nmae(y_val, val_preds)
+        nmse = calc_nmse(y_val, val_preds)
+        
+        print(f"[{name}] -> Inner Val NMAE: {nmae:.5f} | Inner Val NMSE: {nmse:.5f}")
+        
+        if nmae < best_nmae:
+            best_nmae = nmae
+            best_model_name = name
+            best_model_obj = model
+
+    print(f"\nWinning Model Selected: {best_model_name} (NMAE = {best_nmae:.5f})")
+
+    # Retrain the winning model architecture on 100% of training data
+    print("\nScaling full dataset and retraining winner...")
+    scaler_full = StandardScaler()
+    Z_train_scaled = scaler_full.fit_transform(Z_train)
     del Z_train
 
-    print("Training HuberRegressor...")
-    model = HuberRegressor(
-        alpha=HUBER_ALPHA,
-        epsilon=HUBER_EPSILON,
-        max_iter=HUBER_MAX_ITER,
-        tol=1e-3
-    )
-    model.fit(Z_train_scaled, y_train)
+    # Re-instantiate winning model type
+    if "Ridge" in best_model_name:
+        final_model = Ridge(alpha=100.0)
+    elif "LinearSVR" in best_model_name:
+        final_model = LinearSVR(epsilon=0.0, C=1.0, max_iter=3000, random_state=42)
+    else:
+        final_model = HuberRegressor(alpha=1e-4, epsilon=1.35, max_iter=2000)
+
+    final_model.fit(Z_train_scaled, y_train)
     del Z_train_scaled, y_train
 
-    print("Loading test data and predicting...")
+    print("Loading test data and generating predictions...")
     test_df = pd.read_csv(test_path)
     X_test_raw = test_df[feature_columns].to_numpy(dtype=np.float32)
     del test_df
@@ -224,12 +270,12 @@ def main():
     Z_test, _ = extract_features(X_test_raw, feature_columns)
     del X_test_raw
 
-    Z_test_scaled = scaler.transform(Z_test)
+    Z_test_scaled = scaler_full.transform(Z_test)
     del Z_test
 
-    predictions = model.predict(Z_test_scaled)
+    predictions = final_model.predict(Z_test_scaled)
     np.savetxt(predictions_path, predictions, fmt="%.10f")
-    print(f"Done! Predictions saved to {predictions_path}")
+    print(f"Predictions successfully saved to {predictions_path}")
 
 if __name__ == "__main__":
     main()
