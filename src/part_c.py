@@ -10,7 +10,7 @@ from sklearn.linear_model import HuberRegressor
 # ============================================================
 
 HUBER_ALPHA = 1e-4       
-HUBER_EPSILON = 1.05     # Lowered to 1.05 to heavily optimize for Absolute Error (NMAE)
+HUBER_EPSILON = 1.05     # Optimized for NMAE (Absolute Error)
 HUBER_MAX_ITER = 2000    
 
 EXPECTED_RAW_FEATURES = 1640 
@@ -74,80 +74,99 @@ def row_local_extrema(x):
     return np.sum((diff[:, :-1] * diff[:, 1:]) < 0, axis=1).astype(np.float32)
 
 # ============================================================
-# Advanced Time-Domain Features (Replacing FFT)
+# High-Speed Vectorized Cardiac Autocorrelation (No Python Loops)
 # ============================================================
 
-def add_tkeo_features(features, names, x, prefix):
-    """Teager-Kaiser Energy Operator (TKEO) to isolate systolic peaks."""
-    # x[n]^2 - x[n-1]*x[n+1]
+def vectorized_multi_peak_autocorr(signal, fs=64.0, prefix="bvp"):
+    """
+    Computes sub-sample parabolic interpolated primary & secondary 
+    autocorrelation peaks for an entire 2D matrix instantly.
+    """
+    n_samples = signal.shape[0]
+    lags = np.arange(15, 100) # Lags covering ~38 BPM to 256 BPM
+    
+    mean = np.mean(signal, axis=1, keepdims=True, dtype=np.float32)
+    centered = signal - mean
+    denom = np.sum(centered * centered, axis=1, keepdims=True) + 1e-10
+    
+    # 1. Compute 2D Autocorrelations across all lags simultaneously
+    R_list = []
+    for lag in lags:
+        num = np.sum(centered[:, :-lag] * centered[:, lag:], axis=1)
+        R_list.append(num)
+    R = np.column_stack(R_list) / denom # Shape: (N, 85)
+    
+    # 2. Vectorized Primary Peak & Sub-sample Parabolic Interpolation
+    best_idx = np.argmax(R, axis=1)
+    rows = np.arange(n_samples)
+    idx_clamped = np.clip(best_idx, 1, len(lags) - 2)
+    
+    Rm1 = R[rows, idx_clamped - 1]
+    R0  = R[rows, idx_clamped]
+    Rp1 = R[rows, idx_clamped + 1]
+    
+    denom_p = 2.0 * (Rm1 - 2.0 * R0 + Rp1)
+    denom_safe = np.where(np.abs(denom_p) < 1e-7, 1.0, denom_p)
+    delta = np.where(np.abs(denom_p) < 1e-7, 0.0, (Rm1 - Rp1) / denom_safe)
+    
+    tau_true_1 = lags[idx_clamped] + delta
+    bpm_1 = (fs * 60.0) / np.maximum(tau_true_1, 1.0)
+    score_1 = R[rows, best_idx]
+    
+    # 3. Vectorized Secondary Peak Extraction (Harmonic check)
+    b_idx = best_idx[:, None]
+    lag_indices = np.arange(len(lags))[None, :]
+    mask = np.abs(lag_indices - b_idx) <= 5
+    R_masked = np.where(mask, -1.0, R)
+    
+    second_idx = np.argmax(R_masked, axis=1)
+    idx_clamped_2 = np.clip(second_idx, 1, len(lags) - 2)
+    
+    Rm1_2 = R[rows, idx_clamped_2 - 1]
+    R0_2  = R[rows, idx_clamped_2]
+    Rp1_2 = R[rows, idx_clamped_2 + 1]
+    
+    denom_p2 = 2.0 * (Rm1_2 - 2.0 * R0_2 + Rp1_2)
+    denom_safe2 = np.where(np.abs(denom_p2) < 1e-7, 1.0, denom_p2)
+    delta2 = np.where(np.abs(denom_p2) < 1e-7, 0.0, (Rm1_2 - Rp1_2) / denom_safe2)
+    
+    tau_true_2 = lags[idx_clamped_2] + delta2
+    bpm_2 = (fs * 60.0) / np.maximum(tau_true_2, 1.0)
+    score_2 = R[rows, second_idx]
+    
+    return {
+        f"{prefix}_bpm_1": bpm_1.astype(np.float32),
+        f"{prefix}_score_1": score_1.astype(np.float32),
+        f"{prefix}_bpm_2": bpm_2.astype(np.float32),
+        f"{prefix}_score_2": score_2.astype(np.float32),
+        f"{prefix}_bpm_ratio": (bpm_1 / (bpm_2 + 1e-5)).astype(np.float32)
+    }
+
+# ============================================================
+# Advanced Time-Domain Physics & Signal Cleanliness
+# ============================================================
+
+def compute_tkeo(x):
+    """Teager-Kaiser Energy Operator: x[n]^2 - x[n-1]*x[n+1]"""
     x_sq = x[:, 1:-1] ** 2
     x_adj = x[:, :-2] * x[:, 2:]
-    tkeo = x_sq - x_adj
-    
-    add_feature(features, names, np.mean(tkeo, axis=1), f"{prefix}_tkeo_mean")
-    add_feature(features, names, np.std(tkeo, axis=1), f"{prefix}_tkeo_std")
-    add_feature(features, names, np.max(tkeo, axis=1), f"{prefix}_tkeo_max")
-    add_feature(features, names, row_zero_crossings(tkeo), f"{prefix}_tkeo_zero_cross")
+    return x_sq - x_adj
 
 def add_hjorth_parameters(features, names, x, prefix):
-    """Hjorth Parameters for time-domain frequency estimation."""
+    """Hjorth Activity, Mobility, & Complexity as time-domain frequency proxies."""
     var_x = np.var(x, axis=1) + 1e-10
-    
     dx = np.diff(x, axis=1)
     var_dx = np.var(dx, axis=1) + 1e-10
-    
     ddx = np.diff(dx, axis=1)
     var_ddx = np.var(ddx, axis=1) + 1e-10
     
     mobility_x = np.sqrt(var_dx / var_x)
     mobility_dx = np.sqrt(var_ddx / var_dx)
-    
     complexity = mobility_dx / (mobility_x + 1e-10)
     
     add_feature(features, names, var_x, f"{prefix}_hjorth_activity")
     add_feature(features, names, mobility_x, f"{prefix}_hjorth_mobility")
     add_feature(features, names, complexity, f"{prefix}_hjorth_complexity")
-
-def dominant_cardiac_period_interpolated(bvp):
-    """Sub-Sample Parabolic Interpolation of Autocorrelation for continuous BPM."""
-    # Lags from 15 to 100 cover roughly 38 BPM to 256 BPM at 64Hz
-    lags = np.arange(15, 100)
-    mean = np.mean(bvp, axis=1, keepdims=True, dtype=np.float32)
-    centered = bvp - mean
-    denominator = np.sum(centered * centered, axis=1) + 1e-10
-    
-    autocorrelations = []
-    for lag in lags:
-        numerator = np.sum(centered[:, :-lag] * centered[:, lag:], axis=1)
-        autocorrelations.append(numerator / denominator)
-        
-    R = np.column_stack(autocorrelations)
-    best_idx = np.argmax(R, axis=1)
-    
-    tau_true = np.zeros(bvp.shape[0], dtype=np.float32)
-    peak_ac = np.zeros(bvp.shape[0], dtype=np.float32)
-    
-    for i in range(bvp.shape[0]):
-        idx = best_idx[i]
-        peak_ac[i] = R[i, idx]
-        
-        # Apply Parabolic Interpolation if not at the boundaries
-        if 0 < idx < len(lags) - 1:
-            Rm1 = R[i, idx - 1]
-            R0 = R[i, idx]
-            Rp1 = R[i, idx + 1]
-            
-            denom = 2 * (Rm1 - 2 * R0 + Rp1)
-            if denom != 0:
-                delta = (Rm1 - Rp1) / denom
-            else:
-                delta = 0
-            tau_true[i] = lags[idx] + delta
-        else:
-            tau_true[i] = lags[idx]
-            
-    bpm = (3840.0 / (tau_true + 1e-7)) # 60 * 64Hz = 3840
-    return bpm.astype(np.float32), peak_ac.astype(np.float32)
 
 # ============================================================
 # Feature assembly helpers
@@ -208,36 +227,6 @@ def add_block_summary(features, names, x, block_size, prefix):
     add_feature(features, names, row_slope(means), f"{prefix}_blockmean_slope")
     add_feature(features, names, np.mean(stds, axis=1), f"{prefix}_blockstd_mean")
 
-# ============================================================
-# BVP / cardiac features
-# ============================================================
-
-def vpg_bpm(bvp):
-    vpg = np.diff(bvp, axis=1)
-    crossings = ((vpg[:, :-1] <= 0) & (vpg[:, 1:] > 0))
-    beat_count = np.sum(crossings, axis=1)
-    return (beat_count * 6.0).astype(np.float32)
-
-def add_vpg_features(features, names, bvp):
-    vpg = np.diff(bvp, axis=1)
-    apg = np.diff(vpg, axis=1)
-
-    add_basic_features(features, names, vpg, "vpg")
-    add_basic_features(features, names, apg, "apg")
-    add_feature(features, names, vpg_bpm(bvp), "vpg_estimated_bpm")
-
-    # Replaced basic lag estimation with High-Precision Parabolic Interpolation
-    dominant_bpm, dominant_ac = dominant_cardiac_period_interpolated(bvp)
-    add_feature(features, names, dominant_bpm, "bvp_dominant_bpm_interp")
-    add_feature(features, names, dominant_ac, "bvp_dominant_autocorr_interp")
-
-    positive_energy = np.mean(np.maximum(vpg, 0.0) ** 2, axis=1)
-    negative_energy = np.mean(np.minimum(vpg, 0.0) ** 2, axis=1) + 1e-10
-
-    add_feature(features, names, positive_energy / negative_energy, "bvp_rise_fall_energy_ratio")
-    add_feature(features, names, np.mean(np.maximum(vpg, 0.0), axis=1), "bvp_rise_strength")
-    add_feature(features, names, np.mean(np.abs(np.minimum(vpg, 0.0)), axis=1), "bvp_fall_strength")
-
 def add_temporal_position_features(features, names, x, prefix, n_blocks=4):
     n_samples = x.shape[1]
     if n_samples % n_blocks != 0:
@@ -275,79 +264,67 @@ def extract_features(X_raw, feature_columns):
     bvp = X_raw[:, bvp_idx]
     eda = X_raw[:, eda_idx]
 
-    # ========================================================
-    # 1. BVP
-    # ========================================================
+    # Motion Power & Exponential Motion Mask
+    acc_sq = (acc_x * acc_x + acc_y * acc_y + acc_z * acc_z)
+    acc_var = np.var(acc_sq, axis=1, dtype=np.float32)
+    motion_cleanliness = np.exp(-0.5 * acc_var).astype(np.float32)
+
+    # 1. BVP & Derivatives
     cardiac_lags = [16, 20, 24, 28, 32, 38, 44, 50, 58, 66, 76, 86, 96]
     add_deep_features(features, names, bvp, "bvp", cardiac_lags)
     add_block_summary(features, names, bvp, 64, "bvp")
-    add_vpg_features(features, names, bvp)
     add_temporal_position_features(features, names, bvp, "bvp")
-    
-    # Advanced BVP Time-Domain Physics
-    add_tkeo_features(features, names, bvp, "bvp")
     add_hjorth_parameters(features, names, bvp, "bvp")
 
-    # ========================================================
-    # 2. ACCELEROMETER
-    # ========================================================
+    vpg = np.diff(bvp, axis=1) # 1st Derivative (Velocity)
+    apg = np.diff(vpg, axis=1) # 2nd Derivative (Acceleration)
+    tkeo_bvp = compute_tkeo(bvp) # TKEO energy
+
+    # Extract Multi-Harmonic Candidate BPMs across multiple signals
+    bvp_autocorr = vectorized_multi_peak_autocorr(bvp, fs=64.0, prefix="bvp")
+    vpg_autocorr = vectorized_multi_peak_autocorr(vpg, fs=64.0, prefix="vpg")
+    tkeo_autocorr = vectorized_multi_peak_autocorr(tkeo_bvp, fs=64.0, prefix="tkeo")
+
+    # Add BPM candidates, confidence scores, and Motion-Gated Interactions
+    for ac_dict in [bvp_autocorr, vpg_autocorr, tkeo_autocorr]:
+        for k, v in ac_dict.items():
+            add_feature(features, names, v, k)
+            if "bpm_1" in k:
+                # Non-linear basis terms for candidate BPMs
+                add_feature(features, names, v ** 2, f"{k}_sq")
+                add_feature(features, names, np.sqrt(np.maximum(v, 0.0)), f"{k}_sqrt")
+                add_feature(features, names, 1.0 / (v + 1.0), f"{k}_recip")
+                # Motion-Gated Candidate: Only trust candidate BPM when wrist is still
+                add_feature(features, names, v * motion_cleanliness, f"{k}_gated_motion")
+
+    # 2. Accelerometer Kinematics
     add_basic_features(features, names, acc_x, "acc_x")
     add_basic_features(features, names, acc_y, "acc_y")
     add_basic_features(features, names, acc_z, "acc_z")
 
-    acc_sq = (acc_x * acc_x + acc_y * acc_y + acc_z * acc_z)
     acc_sq_mean = np.mean(acc_sq, axis=1, keepdims=True)
     acc_sq_norm = acc_sq / np.where(acc_sq_mean < 1e-7, 1.0, acc_sq_mean)
 
     add_deep_features(features, names, acc_sq, "acc_sq", [1, 2, 4, 8, 16])
     add_basic_features(features, names, acc_sq_norm, "acc_sq_norm")
     add_block_summary(features, names, acc_sq, 32, "acc_sq")
-    
-    # Advanced ACC Kinematics
     add_hjorth_parameters(features, names, acc_sq, "acc_sq")
 
     jerk = np.diff(acc_sq, axis=1)
     add_basic_features(features, names, jerk, "jerk")
 
-    acc_sq_sorted = np.sort(acc_sq, axis=1)
-    idx_10 = int(0.10 * (acc_sq.shape[1] - 1))
-    idx_90 = int(0.90 * (acc_sq.shape[1] - 1))
-    burstiness = acc_sq_sorted[:, idx_90] - acc_sq_sorted[:, idx_10]
-    add_feature(features, names, burstiness, "acc_sq_burstiness")
-
-    second_diff = np.diff(acc_sq, n=2, axis=1)
-    add_feature(features, names, np.mean(np.abs(second_diff), axis=1), "acc_sq_second_diff_abs_mean")
-    add_feature(features, names, np.std(second_diff, axis=1), "acc_sq_second_diff_std")
-    add_temporal_position_features(features, names, acc_sq, "acc_sq")
-
-    # ========================================================
     # 3. EDA
-    # ========================================================
     add_deep_features(features, names, eda, "eda", [1, 2, 4])
     add_block_summary(features, names, eda, 4, "eda")
     add_temporal_position_features(features, names, eda, "eda")
 
-    # ========================================================
-    # 4. Physiologically Motivated Interactions
-    # ========================================================
-    bvp_bpm_val = vpg_bpm(bvp)
-    acc_rms_val = row_rms(acc_sq)
-    eda_mean_val = row_mean(eda)
+    # 4. Interactions & Quality Indices
+    bvp_var = np.var(bvp, axis=1, dtype=np.float32)
+    snr_time = bvp_var / (acc_var + 1e-5)
+    add_feature(features, names, snr_time, "snr_time_domain")
+    add_feature(features, names, motion_cleanliness, "motion_cleanliness_mask")
 
-    add_feature(features, names, bvp_bpm_val * acc_rms_val, "interaction_bpm_motion")
-    add_feature(features, names, row_std(bvp) * row_std(acc_sq), "interaction_bvp_motion_variability")
-    add_feature(features, names, bvp_bpm_val * eda_mean_val, "interaction_bpm_eda")
-    add_feature(features, names, acc_rms_val * eda_mean_val, "interaction_motion_eda")
-    
-    # SNR equivalent (Variance Ratios)
-    acc_var = np.var(acc_sq, axis=1)
-    bvp_var = np.var(bvp, axis=1)
-    snr_time_domain = bvp_var / (acc_var + 1e-5)
-    add_feature(features, names, snr_time_domain, "time_domain_bvp_acc_snr")
-
-    # --------------------------------------------------------
     # Final matrix compilation
-    # --------------------------------------------------------
     Z = np.column_stack(features).astype(np.float32)
 
     if not np.all(np.isfinite(Z)):
@@ -357,7 +334,7 @@ def extract_features(X_raw, feature_columns):
 
 
 # ============================================================
-# Main
+# Main Execution
 # ============================================================
 
 def main():
@@ -386,19 +363,18 @@ def main():
     X_train_raw = train_df[feature_columns].to_numpy(dtype=np.float32)
     del train_df
 
-    print("Creating comprehensive domain-engineered features...")
+    print("Extracting high-speed non-linear physiological features...")
     Z_train, feature_names = extract_features(X_train_raw, feature_columns)
     del X_train_raw
 
     print(f"Feature matrix built successfully: {Z_train.shape}")
-    print(f"Total number of engineered features: {len(feature_names)}")
 
     print("Fitting StandardScaler on training data...")
     scaler = StandardScaler()
     Z_train_scaled = scaler.fit_transform(Z_train)
     del Z_train
 
-    print("\nFitting final HuberRegressor...")
+    print("\nFitting HuberRegressor...")
     model = HuberRegressor(
         alpha=HUBER_ALPHA,
         epsilon=HUBER_EPSILON,
@@ -407,8 +383,7 @@ def main():
     )
     model.fit(Z_train_scaled, y_train)
 
-    print("Huber model fitted successfully.")
-    print(f"Iterations used = {model.n_iter_}")
+    print(f"Huber model fitted in {model.n_iter_} iterations.")
 
     del Z_train_scaled
     del y_train
