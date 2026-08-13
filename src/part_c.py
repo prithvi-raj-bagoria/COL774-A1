@@ -5,15 +5,16 @@ import pandas as pd
 from sklearn.preprocessing import StandardScaler
 from sklearn.linear_model import HuberRegressor
 
+
 # ============================================================
 # Configuration
 # ============================================================
 
-HUBER_ALPHA = 1e-5       # Restored to original optimal value[cite: 4]
-HUBER_EPSILON = 1.25     # Restored to original optimal value[cite: 4]
-HUBER_MAX_ITER = 1000    #[cite: 4]
+HUBER_ALPHA = 1e-5
+HUBER_EPSILON = 1.25  
+HUBER_MAX_ITER = 1000
 
-EXPECTED_RAW_FEATURES = 1640 #[cite: 4]
+EXPECTED_RAW_FEATURES = 1640
 
 # ============================================================
 # Basic feature helpers
@@ -72,6 +73,7 @@ def row_zero_crossings(x):
 def row_local_extrema(x):
     diff = np.diff(x, axis=1)
     return np.sum((diff[:, :-1] * diff[:, 1:]) < 0, axis=1).astype(np.float32)
+
 
 # ============================================================
 # Feature assembly helpers
@@ -132,48 +134,84 @@ def add_block_summary(features, names, x, block_size, prefix):
     add_feature(features, names, row_slope(means), f"{prefix}_blockmean_slope")
     add_feature(features, names, np.mean(stds, axis=1), f"{prefix}_blockstd_mean")
 
+
 # ============================================================
-# NEW: Safe Windowed Spectral Features (No Gibbs Ringing)
+# NEW PHYSICS/MATH FEATURES (Upgraded for Sub-BPM Precision)
 # ============================================================
 
-def add_safe_spectral_features(features, names, bvp, acc_sq):
-    """Safely extracts frequency peaks using a Hanning window to prevent leakage."""
-    # Apply Hanning window to prevent FFT spectral leakage
+def add_spectral_features(features, names, bvp, acc_sq):
+    """Concept 1 & 3: High-Resolution Windowed Zero-Padded FFT"""
+    # Apply Hanning window to prevent frequency leakage at the start/end of 10s blocks
     bvp_w = bvp * np.hanning(bvp.shape[1])
     acc_w = acc_sq * np.hanning(acc_sq.shape[1])
-
-    # 1. BVP Spectral (64 Hz)
-    bvp_fft = np.abs(np.fft.rfft(bvp_w, axis=1))
-    bvp_power = bvp_fft ** 2
-    bvp_freqs = np.fft.rfftfreq(bvp.shape[1], d=1.0/64.0)
     
+    # Pad signals to 10x length for pure numpy frequency interpolation (0.01 Hz resolution)
+    bvp_pad_len = bvp.shape[1] * 10
+    acc_pad_len = acc_sq.shape[1] * 10
+
+    # 1. BVP Spectral 
+    bvp_fft = np.abs(np.fft.rfft(bvp_w, n=bvp_pad_len, axis=1))
+    bvp_power = bvp_fft ** 2
+    bvp_freqs = np.fft.rfftfreq(bvp_pad_len, d=1.0/64.0)
+    
+    # Mask frequencies typical for heart rate (0.7 Hz to 3.0 Hz -> 42-180 BPM)
     bvp_mask = (bvp_freqs >= 0.7) & (bvp_freqs <= 3.0)
     bvp_hr_fft = bvp_fft[:, bvp_mask]
+    bvp_hr_power = bvp_power[:, bvp_mask]
     bvp_hr_freqs = bvp_freqs[bvp_mask]
     
+    # Extract dominant BVP frequency peak with ~0.6 BPM precision
     bvp_peak_idx = np.argmax(bvp_hr_fft, axis=1)
     bvp_peak_bpm = bvp_hr_freqs[bvp_peak_idx] * 60.0
-    add_feature(features, names, bvp_peak_bpm, "win_bvp_spectral_peak_bpm")
+    add_feature(features, names, bvp_peak_bpm, "bvp_spectral_peak_bpm_fine")
     
-    # 2. ACC Spectral (32 Hz)
-    acc_fft = np.abs(np.fft.rfft(acc_w, axis=1))
-    acc_freqs = np.fft.rfftfreq(acc_sq.shape[1], d=1.0/32.0)
+    # Calculate Spectral Entropy (Signal chaos)
+    p_bvp = bvp_hr_power / (np.sum(bvp_hr_power, axis=1, keepdims=True) + 1e-10)
+    bvp_entropy = -np.sum(p_bvp * np.log2(p_bvp + 1e-10), axis=1)
+    add_feature(features, names, bvp_entropy, "bvp_spectral_entropy")
+    
+    # 2. ACC Spectral 
+    acc_fft = np.abs(np.fft.rfft(acc_w, n=acc_pad_len, axis=1))
+    acc_freqs = np.fft.rfftfreq(acc_pad_len, d=1.0/32.0)
     
     acc_mask = (acc_freqs >= 0.7) & (acc_freqs <= 3.0)
     acc_hr_fft = acc_fft[:, acc_mask]
     acc_hr_freqs = acc_freqs[acc_mask]
     
+    # Extract dominant Movement frequency peak
     acc_peak_idx = np.argmax(acc_hr_fft, axis=1)
     acc_peak_bpm = acc_hr_freqs[acc_peak_idx] * 60.0
-    add_feature(features, names, acc_peak_bpm, "win_acc_spectral_peak_bpm")
+    add_feature(features, names, acc_peak_bpm, "acc_spectral_peak_bpm_fine")
     
-    # 3. Orthogonality & SNR
-    add_feature(features, names, np.abs(bvp_peak_bpm - acc_peak_bpm), "win_bvp_acc_spectral_diff")
-    
+    # 3. Spectral Orthogonality
+    add_feature(features, names, np.abs(bvp_peak_bpm - acc_peak_bpm), "bvp_acc_spectral_diff_fine")
+
+def add_snr_features(features, names, bvp, acc_sq, bvp_bpm_estimate):
+    """Concept 2: Signal-to-Noise Ratio (SNR) and Confidence Gating"""
     acc_var = np.var(acc_sq, axis=1)
     bvp_var = np.var(bvp, axis=1)
+    
+    # Power ratio of biological signal to motion artifact
     snr = bvp_var / (acc_var + 1e-5)
-    add_feature(features, names, snr, "win_bvp_acc_snr")
+    add_feature(features, names, snr, "bvp_acc_snr")
+    
+    # Mathematical gating: Force the HR estimate down if motion variance is dangerously high
+    confidence = 1.0 / (1.0 + acc_var)
+    gated_bpm = bvp_bpm_estimate * confidence
+    add_feature(features, names, gated_bpm, "bvp_bpm_gated_by_acc")
+
+def add_eda_derivatives(features, names, eda):
+    """Concept 4: Physiological Autonomic Coupling via EDA Kinematics"""
+    eda_vel = np.diff(eda, axis=1)
+    eda_acc = np.diff(eda_vel, axis=1)
+    
+    add_feature(features, names, np.mean(eda_vel, axis=1), "eda_velocity_mean")
+    add_feature(features, names, np.std(eda_vel, axis=1), "eda_velocity_std")
+    add_feature(features, names, np.max(eda_vel, axis=1), "eda_velocity_max")
+    
+    add_feature(features, names, np.mean(eda_acc, axis=1), "eda_acceleration_mean")
+    add_feature(features, names, np.std(eda_acc, axis=1), "eda_acceleration_std")
+
 
 # ============================================================
 # BVP / cardiac features
@@ -287,6 +325,7 @@ def extract_features(X_raw, feature_columns):
     jerk = np.diff(acc_sq, axis=1)
     add_basic_features(features, names, jerk, "jerk")
 
+    # Fast burstiness computation
     acc_sq_sorted = np.sort(acc_sq, axis=1)
     idx_10 = int(0.10 * (acc_sq.shape[1] - 1))
     idx_90 = int(0.90 * (acc_sq.shape[1] - 1))
@@ -306,7 +345,7 @@ def extract_features(X_raw, feature_columns):
     add_temporal_position_features(features, names, eda, "eda")
 
     # ========================================================
-    # 4. Physiologically Motivated Interactions
+    # 4. Physiologically Motivated Interactions & NEW FEATURES
     # ========================================================
     bvp_bpm_val = vpg_bpm(bvp)
     acc_rms_val = row_rms(acc_sq)
@@ -318,9 +357,11 @@ def extract_features(X_raw, feature_columns):
     add_feature(features, names, acc_rms_val * eda_mean_val, "interaction_motion_eda")
 
     # --------------------------------------------------------
-    # Safe Injection of Hanning-Windowed Spectral Features
+    # Math/Physics Concepts Injected (Upgraded)
     # --------------------------------------------------------
-    add_safe_spectral_features(features, names, bvp, acc_sq)
+    add_spectral_features(features, names, bvp, acc_sq)
+    add_snr_features(features, names, bvp, acc_sq, bvp_bpm_val)
+    add_eda_derivatives(features, names, eda)
 
     # --------------------------------------------------------
     # Final matrix compilation
