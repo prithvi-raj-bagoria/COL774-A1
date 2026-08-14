@@ -69,7 +69,7 @@ def row_sma(x, y, z):
 # 4. Feature Assembly Framework (Base & Polynomial)
 # ============================================================
 def extract_base_features(X_raw, feature_columns):
-    """Extracts a tight, highly curated set of ~30 biological base features."""
+    """Extracts a tight, highly curated set of biological base features including Non-FFT Spectral Proxies (1) and APG Shape Statistics (4)."""
     features, names = [], []
     
     acc_x = X_raw[:, [i for i, c in enumerate(feature_columns) if c.startswith("acc_x_")]]
@@ -85,25 +85,42 @@ def extract_base_features(X_raw, feature_columns):
     features.append(row_zero_crossings(bvp)); names.append("bvp_zcross")
     features.append(row_local_extrema(bvp)); names.append("bvp_extrema")
 
-    # --- B. Frequency Equalizer (Autocorrelation Bins) ---
+    # --- B. Frequency Equalizer via Autocorrelation Bins ---
     bpm_targets = [50, 60, 70, 80, 90, 100, 110, 120, 130, 140, 150, 170]
     for bpm in bpm_targets:
         lag = int(60.0 * 64 / bpm)
         features.append(row_autocorr_lag(bvp, lag))
         names.append(f"bvp_ac_{bpm}bpm")
 
-    # --- C. VPG/APG (Velocity & Acceleration of Blood) ---
+    # --- C. Non-FFT Frequency Proxies (Suggestion 1) ---
     vpg = np.diff(bvp, axis=1)
     apg = np.diff(vpg, axis=1)
     
+    # Mean frequency approximation using zero-crossing rates of signals and derivatives (Rice's formula proxies)
+    features.append(row_zero_crossings(vpg)); names.append("vpg_zcross_freq")
+    features.append(row_zero_crossings(apg)); names.append("apg_zcross_freq")
+    
+    # Cumulative autocorrelation energy across multiple frequency bands
+    ac_energy_low = row_autocorr_lag(bvp, 32) + row_autocorr_lag(bvp, 38)
+    ac_energy_high = row_autocorr_lag(bvp, 16) + row_autocorr_lag(bvp, 22)
+    features.append(ac_energy_low); names.append("bvp_ac_energy_low")
+    features.append(ac_energy_high); names.append("bvp_ac_energy_high")
+
+    # --- D. VPG & Advanced APG Shape Statistics (Suggestion 4) ---
     features.append(row_std(vpg)); names.append("vpg_std")
     features.append(row_skewness(vpg)); names.append("vpg_skew")
+    
+    # Comprehensive APG waveform inflection point metrics (a, b, c, d, e waves proxy)
     features.append(row_std(apg)); names.append("apg_std")
+    features.append(row_skewness(apg)); names.append("apg_skew")
+    features.append(row_kurtosis(apg)); names.append("apg_kurt")
+    features.append(row_zero_crossings(apg)); names.append("apg_zcross")
+    features.append(row_local_extrema(apg)); names.append("apg_extrema")
     
     est_bpm = (np.sum((vpg[:, :-1] <= 0) & (vpg[:, 1:] > 0), axis=1) * 6.0).astype(np.float32)
     features.append(est_bpm); names.append("vpg_est_bpm")
 
-    # --- D. Context: Motion & Stress ---
+    # --- E. Context: Motion & Stress ---
     acc_sma_val = row_sma(acc_x, acc_y, acc_z)
     features.append(acc_sma_val); names.append("acc_sma")
     
@@ -114,7 +131,7 @@ def extract_base_features(X_raw, feature_columns):
     features.append(row_std(eda)); names.append("eda_std")
     features.append(row_std(np.diff(eda, axis=1))); names.append("eda_diff_std")
 
-    # --- E. Temporal Context (Acceleration/Deceleration) ---
+    # --- F. Temporal Context (Acceleration/Deceleration) ---
     half_bvp = bvp.shape[1] // 2
     half_acc = acc_x.shape[1] // 2
     
@@ -216,7 +233,6 @@ def main():
     start = time.perf_counter()
     print_step(4, 6, "Tuning SGDRegressor (epsilon-insensitive) via 5-Fold CV...")
 
-    # We use L2 penalty here because Lasso already handled the feature selection.
     param_grid = {
         "alpha": [1e-4, 1e-3], 
         "epsilon": [0.01, 0.05, 0.1]
@@ -249,7 +265,6 @@ def main():
     X_test_raw = test_df[feature_columns].to_numpy(dtype=np.float32)
     del test_df
 
-    # Extract base -> Expand -> Scale -> Select
     Z_test_base, _ = extract_base_features(X_test_raw, feature_columns)
     del X_test_raw
     Z_test_poly, _ = expand_polynomials(Z_test_base, base_names)
