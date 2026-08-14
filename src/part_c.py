@@ -3,8 +3,10 @@ import numpy as np
 import pandas as pd
 
 from sklearn.preprocessing import StandardScaler
+from sklearn.svm import LinearSVR
 from sklearn.linear_model import Lasso
-from sklearn.linear_model import LassoCV
+from sklearn.feature_selection import SelectFromModel
+from sklearn.model_selection import GridSearchCV, KFold
 
 # ============================================================
 # Configuration & Constants
@@ -195,24 +197,42 @@ def main():
     Z_train, _ = extract_features(X_train_raw, feature_columns)
     del X_train_raw
 
-    print("Scaling features and fitting Lasso...")
+    print("Scaling features...")
     scaler = StandardScaler()
     Z_train_scaled = scaler.fit_transform(Z_train)
     del Z_train
 
-    print("Fitting LassoCV with internal 5-Fold cross-validation...")
-    model = LassoCV(
-        alphas=[0.0001, 0.001, 0.01, 0.1, 1.0],
-        cv=5,
-        max_iter=5000,
-        random_state=42,
+    print("Selecting features using Lasso (alpha=0.005 for richer feature retention)...")
+    lasso_selector = Lasso(alpha=0.005, max_iter=5000, random_state=42)
+    selector = SelectFromModel(lasso_selector, prefit=False)
+    
+    Z_train_selected = selector.fit_transform(Z_train_scaled, y_train)
+    print(f"Features pruned from {Z_train_scaled.shape[1]} down to {Z_train_selected.shape[1]}")
+    del Z_train_scaled
+
+    print("Tuning LinearSVR hyperparameters using MAE scoring...")
+    cv_strategy = KFold(n_splits=5, shuffle=True, random_state=42)
+    
+    # Grid search specifically targeting absolute error optimization
+    param_grid = {
+        'C': [0.1, 1.0, 10.0],
+        'epsilon': [0.0, 0.1, 0.2]
+    }
+
+    grid_search = GridSearchCV(
+        estimator=LinearSVR(max_iter=5000, random_state=42),
+        param_grid=param_grid,
+        scoring='neg_mean_absolute_error',
+        cv=cv_strategy,
         n_jobs=-1
     )
 
-    model.fit(Z_train_scaled, y_train)
-    print(f"Best Alpha Found: {model.alpha_}")
+    grid_search.fit(Z_train_selected, y_train)
+    print(f"Best Parameters Found: {grid_search.best_params_}")
+    print(f"Best CV Score (Neg MAE): {grid_search.best_score_:.4f}")
 
-    del Z_train_scaled, y_train
+    model = grid_search.best_estimator_
+    del Z_train_selected, y_train
 
     print("Loading test data and extracting features...")
     test_df = pd.read_csv(test_path)
@@ -225,8 +245,11 @@ def main():
     Z_test_scaled = scaler.transform(Z_test)
     del Z_test
 
+    Z_test_selected = selector.transform(Z_test_scaled)
+    del Z_test_scaled
+
     print("Generating predictions...")
-    predictions = model.predict(Z_test_scaled)
+    predictions = model.predict(Z_test_selected)
 
     np.savetxt(predictions_path, predictions, fmt="%.10f")
     print(f"Successfully saved predictions to {predictions_path}")
