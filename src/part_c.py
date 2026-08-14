@@ -4,6 +4,7 @@ import pandas as pd
 
 from sklearn.preprocessing import StandardScaler
 from sklearn.svm import LinearSVR
+from sklearn.model_selection import GridSearchCV, KFold
 
 # ============================================================
 # Configuration & Constants
@@ -199,13 +200,34 @@ def main():
     Z_train_scaled = scaler.fit_transform(Z_train)
     del Z_train
 
-    model = LinearSVR(
-        epsilon=0.0,
-        C=1.0,
-        max_iter=5000,
-        random_state=42
+    print("Tuning hyperparameters using 5-Fold GridSearchCV...")
+    # Set up robust cross-validation splits
+    cv_strategy = KFold(n_splits=5, shuffle=True, random_state=42)
+
+    # Define the search grid with well-reasoned values
+    param_grid = {
+        'C': [0.1, 1.0, 10.0],
+        'epsilon': [0.0, 0.1, 0.5]
+    }
+
+    # Configure GridSearchCV (n_jobs=-1 uses all CPU cores to speed things up)
+    grid_search = GridSearchCV(
+        estimator=LinearSVR(max_iter=5000, random_state=42),
+        param_grid=param_grid,
+        scoring='neg_mean_squared_error',
+        cv=cv_strategy,
+        n_jobs=-1
     )
-    model.fit(Z_train_scaled, y_train)
+
+    # Fit the grid search on training data only
+    grid_search.fit(Z_train_scaled, y_train)
+
+    print(f"Best Parameters Found: {grid_search.best_params_}")
+    print(f"Best CV Score (Neg MSE): {grid_search.best_score_:.4f}")
+
+    # Extract the best estimator to use for test predictions
+    model = grid_search.best_estimator_
+
     del Z_train_scaled, y_train
 
     print("Loading test data and extracting features...")
