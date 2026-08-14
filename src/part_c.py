@@ -14,7 +14,7 @@ from sklearn.model_selection import GridSearchCV, KFold
 EXPECTED_RAW_FEATURES = 1640
 LASSO_ALPHA = 0.005
 LASSO_MAX_ITER = 1500
-CV_FOLDS = 5
+CV_FOLDS = 3
 RANDOM_STATE = 42
 
 # ============================================================
@@ -65,11 +65,47 @@ def row_sma(x, y, z):
     """Signal Magnitude Area: Actigraphy standard for physical exertion."""
     return np.sum(np.abs(x) + np.abs(y) + np.abs(z), axis=1, dtype=np.float32)
 
+# --- NEW ADVANCED MATH HELPERS ---
+def row_tkeo_mean(x):
+    """Teager-Kaiser Energy Operator: Penalizes rapid, erratic motion shocks."""
+    if x.shape[1] < 3: return np.zeros(x.shape[0], dtype=np.float32)
+    tkeo = x[:, 1:-1]**2 - (x[:, :-2] * x[:, 2:])
+    return np.mean(tkeo, axis=1, dtype=np.float32)
+
+def row_shannon_entropy(x):
+    """Fast Vectorized Shannon Entropy Proxy for Signal Quality Index (SQI)."""
+    mean = np.mean(x, axis=1, keepdims=True, dtype=np.float32)
+    std = np.std(x, axis=1, keepdims=True, dtype=np.float32) + 1e-7
+    z = (x - mean) / std
+    
+    # Vectorized bin probabilities
+    P = np.column_stack([
+        np.mean(z < -2, axis=1),
+        np.mean((z >= -2) & (z < -1), axis=1),
+        np.mean((z >= -1) & (z < 0), axis=1),
+        np.mean((z >= 0) & (z < 1), axis=1),
+        np.mean((z >= 1) & (z < 2), axis=1),
+        np.mean(z >= 2, axis=1)
+    ]) + 1e-10 # Prevent log(0)
+    
+    return -np.sum(P * np.log(P), axis=1).astype(np.float32)
+
+def row_eda_phasic_energy(x):
+    """Isolates Phasic EDA (stress spikes) from Tonic EDA (baseline drift)."""
+    window = 8 # Approx 2 seconds if EDA is sampled at 4Hz
+    if x.shape[1] < window: return np.zeros(x.shape[0], dtype=np.float32)
+    
+    # Fast rolling average via cumulative sum
+    cs = np.cumsum(x, axis=1, dtype=np.float32)
+    tonic = (cs[:, window:] - cs[:, :-window]) / window
+    phasic = x[:, window:] - tonic
+    return np.sum(phasic**2, axis=1).astype(np.float32)
+
 # ============================================================
 # 4. Feature Assembly Framework (Base & Polynomial)
 # ============================================================
 def extract_base_features(X_raw, feature_columns):
-    """Extracts a tight, highly curated set of biological base features including Non-FFT Spectral Proxies (1) and APG Shape Statistics (4)."""
+    """Extracts a tight, highly curated set of advanced biological base features."""
     features, names = [], []
     
     acc_x = X_raw[:, [i for i, c in enumerate(feature_columns) if c.startswith("acc_x_")]]
@@ -78,40 +114,51 @@ def extract_base_features(X_raw, feature_columns):
     bvp = X_raw[:, [i for i, c in enumerate(feature_columns) if c.startswith("bvp_")]]
     eda = X_raw[:, [i for i, c in enumerate(feature_columns) if c.startswith("eda_")]]
 
-    # --- A. BVP Pulse Morphology ---
+    # Pre-compute derivatives for multiple feature sets
+    vpg = np.diff(bvp, axis=1)
+    apg = np.diff(vpg, axis=1)
+
+    # --- A. BVP Pulse Morphology & SQI ---
     features.append(row_std(bvp)); names.append("bvp_std")
     features.append(row_skewness(bvp)); names.append("bvp_skew")
     features.append(row_kurtosis(bvp)); names.append("bvp_kurt")
     features.append(row_zero_crossings(bvp)); names.append("bvp_zcross")
     features.append(row_local_extrema(bvp)); names.append("bvp_extrema")
+    features.append(row_shannon_entropy(bvp)); names.append("bvp_entropy_sqi") # NEW: Signal Quality
 
-    # --- B. Frequency Equalizer via Autocorrelation Bins ---
+    # --- B. Hjorth Parameters (Waveform Complexity) ---
+    bvp_std_val = row_std(bvp) + 1e-7
+    vpg_std_val = row_std(vpg) + 1e-7
+    apg_std_val = row_std(apg) + 1e-7
+    
+    mobility_bvp = vpg_std_val / bvp_std_val
+    mobility_vpg = apg_std_val / vpg_std_val
+    complexity_bvp = mobility_vpg / (mobility_bvp + 1e-7)
+    
+    features.append(mobility_bvp); names.append("bvp_hjorth_mobility")      # NEW: Hjorth 1
+    features.append(complexity_bvp); names.append("bvp_hjorth_complexity")  # NEW: Hjorth 2
+
+    # --- C. Frequency Equalizer via Autocorrelation Bins ---
     bpm_targets = [50, 60, 70, 80, 90, 100, 110, 120, 130, 140, 150, 170]
     for bpm in bpm_targets:
         lag = int(60.0 * 64 / bpm)
         features.append(row_autocorr_lag(bvp, lag))
         names.append(f"bvp_ac_{bpm}bpm")
 
-    # --- C. Non-FFT Frequency Proxies (Suggestion 1) ---
-    vpg = np.diff(bvp, axis=1)
-    apg = np.diff(vpg, axis=1)
-    
-    # Mean frequency approximation using zero-crossing rates of signals and derivatives (Rice's formula proxies)
+    # --- D. Non-FFT Frequency Proxies ---
     features.append(row_zero_crossings(vpg)); names.append("vpg_zcross_freq")
     features.append(row_zero_crossings(apg)); names.append("apg_zcross_freq")
     
-    # Cumulative autocorrelation energy across multiple frequency bands
     ac_energy_low = row_autocorr_lag(bvp, 32) + row_autocorr_lag(bvp, 38)
     ac_energy_high = row_autocorr_lag(bvp, 16) + row_autocorr_lag(bvp, 22)
     features.append(ac_energy_low); names.append("bvp_ac_energy_low")
     features.append(ac_energy_high); names.append("bvp_ac_energy_high")
 
-    # --- D. VPG & Advanced APG Shape Statistics (Suggestion 4) ---
-    features.append(row_std(vpg)); names.append("vpg_std")
+    # --- E. VPG & Advanced APG Shape Statistics ---
+    features.append(vpg_std_val); names.append("vpg_std")
     features.append(row_skewness(vpg)); names.append("vpg_skew")
     
-    # Comprehensive APG waveform inflection point metrics (a, b, c, d, e waves proxy)
-    features.append(row_std(apg)); names.append("apg_std")
+    features.append(apg_std_val); names.append("apg_std")
     features.append(row_skewness(apg)); names.append("apg_skew")
     features.append(row_kurtosis(apg)); names.append("apg_kurt")
     features.append(row_zero_crossings(apg)); names.append("apg_zcross")
@@ -120,18 +167,23 @@ def extract_base_features(X_raw, feature_columns):
     est_bpm = (np.sum((vpg[:, :-1] <= 0) & (vpg[:, 1:] > 0), axis=1) * 6.0).astype(np.float32)
     features.append(est_bpm); names.append("vpg_est_bpm")
 
-    # --- E. Context: Motion & Stress ---
+    # --- F. Context: Motion & TKEO Artifact Detection ---
     acc_sma_val = row_sma(acc_x, acc_y, acc_z)
     features.append(acc_sma_val); names.append("acc_sma")
     
     acc_sq = acc_x**2 + acc_y**2 + acc_z**2
     features.append(row_std(acc_sq)); names.append("acc_sq_std")
     
+    acc_tkeo_tot = row_tkeo_mean(acc_x) + row_tkeo_mean(acc_y) + row_tkeo_mean(acc_z)
+    features.append(acc_tkeo_tot); names.append("acc_tkeo_total") # NEW: Motion Shocks
+
+    # --- G. Stress: Phasic vs Tonic EDA ---
     features.append(row_mean(eda)); names.append("eda_mean")
     features.append(row_std(eda)); names.append("eda_std")
     features.append(row_std(np.diff(eda, axis=1))); names.append("eda_diff_std")
+    features.append(row_eda_phasic_energy(eda)); names.append("eda_phasic_energy") # NEW: True Stress Spikes
 
-    # --- F. Temporal Context (Acceleration/Deceleration) ---
+    # --- H. Temporal Context (Acceleration/Deceleration) ---
     half_bvp = bvp.shape[1] // 2
     half_acc = acc_x.shape[1] // 2
     
@@ -147,7 +199,6 @@ def expand_polynomials(Z_base, names_base):
     """
     100% Legal Pure-NumPy Polynomial Expander.
     Generates Degree-2 interactions (squared terms + cross-multiplications).
-    Avoids using banned sklearn feature generators.
     """
     poly_features, poly_names = [], []
     n_cols = Z_base.shape[1]
@@ -178,7 +229,7 @@ def main():
     train_path, test_path, predictions_path = sys.argv[1], sys.argv[2], sys.argv[3]
     total_start = time.perf_counter()
 
-    print_header("PART (C) — TRAINING PIPELINE")
+    print_header("PART (C) — TRAINING PIPELINE (ADVANCED BIOSIGNALS)")
 
     # --- Step 1: Loading ---
     start = time.perf_counter()
