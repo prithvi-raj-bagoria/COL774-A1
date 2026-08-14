@@ -11,15 +11,15 @@ from sklearn.model_selection import GridSearchCV, KFold
 # ------------------------------------------------------------
 RAW_FEATURES = 1640
 LASSO_ALPHA = 0.005
-LASSO_MAX_ITER = 2000
-LASSO_TOL = 1e-4
+LASSO_MAX_ITER = 1500
+LASSO_TOL = 1e-3          # relaxed for speed
 CV_FOLDS = 3
 POLY_DEGREE = 2
 RANDOM_STATE = 42
-BASE_SELECT_K = 100          # number of base features kept before polynomial expansion
-LASSO_MAX_FEATURES = 600    # cap on final selected features
-SGD_ALPHAS = [1e-4, 1e-3]
-SGD_EPSILONS = [0.01, 0.05, 0.1]
+BASE_SELECT_K = 100       # no selection if base features < this
+LASSO_MAX_FEATURES = 600
+SGD_ALPHAS = [1e-5, 1e-4, 1e-3, 1e-2]     # expanded grid
+SGD_EPSILONS = [0.01, 0.05, 0.1, 0.2]
 
 # ------------------------------------------------------------
 # Small helpers
@@ -99,6 +99,32 @@ def peak_count(bvp, fs=64):
               (bvp[:, 1:-1] > thr))
     return maxima.sum(axis=1).astype(np.float32)
 
+def rr_features(bvp, fs=64):
+    """Compute RR interval statistics from BVP peak locations."""
+    m = np.mean(bvp, axis=1, keepdims=True, dtype=np.float32)
+    s = np.std(bvp, axis=1, keepdims=True, dtype=np.float32) + 1e-7
+    thr = m + 0.2 * s
+    is_peak = ((bvp[:, 1:-1] > bvp[:, :-2]) &
+               (bvp[:, 1:-1] > bvp[:, 2:]) &
+               (bvp[:, 1:-1] > thr))
+
+    n = bvp.shape[0]
+    rr_mean = np.zeros(n, dtype=np.float32)
+    rr_std = np.zeros(n, dtype=np.float32)
+    rr_rmssd = np.zeros(n, dtype=np.float32)
+    rr_median = np.zeros(n, dtype=np.float32)
+
+    for i in range(n):
+        idx = np.where(is_peak[i])[0] + 1   # +1 because is_peak excludes first/last sample
+        if len(idx) >= 2:
+            rr = np.diff(idx) / fs * 1000.0   # milliseconds
+            rr_mean[i] = np.mean(rr)
+            rr_std[i] = np.std(rr)
+            rr_median[i] = np.median(rr)
+            if len(rr) >= 2:
+                rr_rmssd[i] = np.sqrt(np.mean(np.diff(rr) ** 2))
+    return rr_mean, rr_std, rr_rmssd, rr_median
+
 # ------------------------------------------------------------
 # Feature extraction
 # ------------------------------------------------------------
@@ -167,6 +193,15 @@ def extract_features(X, cols):
     add(np.median(np.abs(bvp - med), axis=1), "bvp_mad")
     add(np.sqrt(np.mean(bvp ** 2, axis=1)), "bvp_rms")
 
+    # RR interval features
+    rr_mean, rr_std, rr_rmssd, rr_median = rr_features(bvp)
+    add(rr_mean, "bvp_rr_mean")
+    add(rr_std, "bvp_rr_std")
+    add(rr_rmssd, "bvp_rr_rmssd")
+    add(rr_median, "bvp_rr_median")
+    hr_from_rr = np.divide(60000.0, rr_mean,out=np.zeros_like(rr_mean),where=rr_mean > 0).astype(np.float32)
+    add(hr_from_rr, "bvp_hr_from_rr")
+
     # ---- Accelerometer features ----
     acc_sq = ax ** 2 + ay ** 2 + az ** 2
     add(sma(ax, ay, az), "acc_sma")
@@ -207,6 +242,20 @@ def extract_features(X, cols):
         (sma(ax[:, :ha], ay[:, :ha], az[:, :ha]) + 1e-7),
         "acc_sma_ratio_h2h1")
 
+    # ---- Per-block aggregate features ----
+    # BVP: reshape to (n, 10, 64)
+    bvp_blocks = bvp.reshape(bvp.shape[0], 10, 64)
+    bvp_block_std = np.std(bvp_blocks, axis=2)
+    add(np.mean(bvp_block_std, axis=1), "bvp_block_std_mean")
+    add(np.std(bvp_block_std, axis=1), "bvp_block_std_std")
+
+    # Accelerometer: stack axes and reshape to (n, 10, 32, 3)
+    acc = np.stack([ax, ay, az], axis=2)  # (n, 320, 3)
+    acc_blocks = acc.reshape(acc.shape[0], 10, 32, 3)
+    acc_block_sma = np.sum(np.abs(acc_blocks), axis=(2, 3))
+    add(np.mean(acc_block_sma, axis=1), "acc_block_sma_mean")
+    add(np.std(acc_block_sma, axis=1), "acc_block_sma_std")
+
     Z = np.column_stack(F).astype(np.float32)
     if not np.all(np.isfinite(Z)):
         raise ValueError("Feature matrix contains NaN/Inf.")
@@ -246,7 +295,7 @@ def main():
 
     train_path, test_path, pred_path = sys.argv[1:4]
     total = time.perf_counter()
-    sec("PART (C) — OPTIMIZED LINEAR PIPELINE")
+    sec("PART (C) — IMPROVED PIPELINE")
 
     # 1. Load training data
     t = time.perf_counter()
@@ -268,7 +317,7 @@ def main():
     del X
     print(f"    base_features={Z.shape[1]}")
 
-    # Optional supervised pre-selection of base features
+    # Supervised pre-selection (only if base features > K)
     if BASE_SELECT_K is not None and BASE_SELECT_K < Z.shape[1]:
         select_k = SelectKBest(f_regression, k=BASE_SELECT_K)
         Z = select_k.fit_transform(Z, y)
@@ -298,7 +347,7 @@ def main():
     print(f"    selected_features={Z.shape[1]}")
     print(f"    done in {time.perf_counter()-t:.2f}s")
 
-    # 4. SGD linear model CV
+    # 4. SGD linear model CV (expanded grid)
     t = time.perf_counter()
     print("\n[4/6] SGD linear-model CV...")
     grid = GridSearchCV(
