@@ -9,13 +9,12 @@ from sklearn.feature_selection import SelectFromModel
 from sklearn.model_selection import GridSearchCV, KFold
 
 # ============================================================
-# 1. Configuration & Hyperparameters (Adaptive Mini-Grid)
+# 1. Configuration & Hyperparameters
 # ============================================================
 EXPECTED_RAW_FEATURES = 1640
 LASSO_ALPHA = 0.005
-LASSO_MAX_ITER = 1000  # Drastically reduced for speed
-LASSO_TOL = 0.01       # Loosened tolerance to force early stopping
-CV_FOLDS = 3           # Fast 3-fold cross validation for adaptability
+LASSO_MAX_ITER = 1500
+CV_FOLDS = 5
 RANDOM_STATE = 42
 
 # ============================================================
@@ -54,15 +53,23 @@ def row_autocorr_lag(x, lag):
     c = x - np.mean(x, axis=1, keepdims=True, dtype=np.float32)
     return (np.sum(c[:, :-lag] * c[:, lag:], axis=1) / (np.sum(c * c, axis=1) + 1e-10)).astype(np.float32)
 
+def row_zero_crossings(x):
+    c = x - np.mean(x, axis=1, keepdims=True, dtype=np.float32)
+    return np.sum((c[:, :-1] * c[:, 1:]) < 0, axis=1).astype(np.float32)
+
+def row_local_extrema(x):
+    d = np.diff(x, axis=1)
+    return np.sum((d[:, :-1] * d[:, 1:]) < 0, axis=1).astype(np.float32)
+
 def row_sma(x, y, z):
     """Signal Magnitude Area: Actigraphy standard for physical exertion."""
     return np.sum(np.abs(x) + np.abs(y) + np.abs(z), axis=1, dtype=np.float32)
 
 # ============================================================
-# 4. Feature Assembly Framework (Base 20 & Cubic Expansion)
+# 4. Feature Assembly Framework (Base & Polynomial)
 # ============================================================
 def extract_base_features(X_raw, feature_columns):
-    """Extracts exactly 20 elite biological features to prepare for k=3 expansion."""
+    """Extracts a tight, highly curated set of ~30 biological base features."""
     features, names = [], []
     
     acc_x = X_raw[:, [i for i, c in enumerate(feature_columns) if c.startswith("acc_x_")]]
@@ -71,26 +78,32 @@ def extract_base_features(X_raw, feature_columns):
     bvp = X_raw[:, [i for i, c in enumerate(feature_columns) if c.startswith("bvp_")]]
     eda = X_raw[:, [i for i, c in enumerate(feature_columns) if c.startswith("eda_")]]
 
-    # 1. BVP Pulse Morphology (3)
+    # --- A. BVP Pulse Morphology ---
     features.append(row_std(bvp)); names.append("bvp_std")
     features.append(row_skewness(bvp)); names.append("bvp_skew")
     features.append(row_kurtosis(bvp)); names.append("bvp_kurt")
+    features.append(row_zero_crossings(bvp)); names.append("bvp_zcross")
+    features.append(row_local_extrema(bvp)); names.append("bvp_extrema")
 
-    # 2. VPG Velocity (2)
-    vpg = np.diff(bvp, axis=1)
-    features.append(row_std(vpg)); names.append("vpg_std")
-    
-    est_bpm = (np.sum((vpg[:, :-1] <= 0) & (vpg[:, 1:] > 0), axis=1) * 6.0).astype(np.float32)
-    features.append(est_bpm); names.append("vpg_est_bpm")
-
-    # 3. Frequency Equalizer (7)
-    bpm_targets = [60, 80, 100, 120, 140, 160, 180]
+    # --- B. Frequency Equalizer (Autocorrelation Bins) ---
+    bpm_targets = [50, 60, 70, 80, 90, 100, 110, 120, 130, 140, 150, 170]
     for bpm in bpm_targets:
         lag = int(60.0 * 64 / bpm)
         features.append(row_autocorr_lag(bvp, lag))
         names.append(f"bvp_ac_{bpm}bpm")
 
-    # 4. Context: Motion & Stress (4)
+    # --- C. VPG/APG (Velocity & Acceleration of Blood) ---
+    vpg = np.diff(bvp, axis=1)
+    apg = np.diff(vpg, axis=1)
+    
+    features.append(row_std(vpg)); names.append("vpg_std")
+    features.append(row_skewness(vpg)); names.append("vpg_skew")
+    features.append(row_std(apg)); names.append("apg_std")
+    
+    est_bpm = (np.sum((vpg[:, :-1] <= 0) & (vpg[:, 1:] > 0), axis=1) * 6.0).astype(np.float32)
+    features.append(est_bpm); names.append("vpg_est_bpm")
+
+    # --- D. Context: Motion & Stress ---
     acc_sma_val = row_sma(acc_x, acc_y, acc_z)
     features.append(acc_sma_val); names.append("acc_sma")
     
@@ -99,8 +112,9 @@ def extract_base_features(X_raw, feature_columns):
     
     features.append(row_mean(eda)); names.append("eda_mean")
     features.append(row_std(eda)); names.append("eda_std")
+    features.append(row_std(np.diff(eda, axis=1))); names.append("eda_diff_std")
 
-    # 5. Temporal Context (4)
+    # --- E. Temporal Context (Acceleration/Deceleration) ---
     half_bvp = bvp.shape[1] // 2
     half_acc = acc_x.shape[1] // 2
     
@@ -112,21 +126,21 @@ def extract_base_features(X_raw, feature_columns):
     Z_base = np.column_stack(features).astype(np.float32)
     return Z_base, names
 
-def expand_polynomials_cubic(Z_base, names_base):
+def expand_polynomials(Z_base, names_base):
     """
-    100% Legal Pure-NumPy Cubic Expander (k=3).
-    Generates Degrees 1, 2, and 3 manually (x, x^2, x*y, x^3, x^2*y, x*y*z).
-    20 base features -> exactly 1770 expanded features.
+    100% Legal Pure-NumPy Polynomial Expander.
+    Generates Degree-2 interactions (squared terms + cross-multiplications).
+    Avoids using banned sklearn feature generators.
     """
     poly_features, poly_names = [], []
     n_cols = Z_base.shape[1]
 
-    # 1. Degree 1
+    # 1. Base Features (Degree 1)
     for i in range(n_cols):
         poly_features.append(Z_base[:, i])
         poly_names.append(names_base[i])
 
-    # 2. Degree 2
+    # 2. Interactions & Squared (Degree 2)
     for i in range(n_cols):
         for j in range(i, n_cols):
             poly_features.append(Z_base[:, i] * Z_base[:, j])
@@ -134,20 +148,6 @@ def expand_polynomials_cubic(Z_base, names_base):
                 poly_names.append(f"{names_base[i]}^2")
             else:
                 poly_names.append(f"{names_base[i]}*{names_base[j]}")
-                
-    # 3. Degree 3
-    for i in range(n_cols):
-        for j in range(i, n_cols):
-            for k in range(j, n_cols):
-                poly_features.append(Z_base[:, i] * Z_base[:, j] * Z_base[:, k])
-                if i == j == k:
-                    poly_names.append(f"{names_base[i]}^3")
-                elif i == j:
-                    poly_names.append(f"{names_base[i]}^2*{names_base[k]}")
-                elif j == k:
-                    poly_names.append(f"{names_base[i]}*{names_base[j]}^2")
-                else:
-                    poly_names.append(f"{names_base[i]}*{names_base[j]}*{names_base[k]}")
 
     Z_poly = np.column_stack(poly_features).astype(np.float32)
     if not np.all(np.isfinite(Z_poly)): raise ValueError("Poly matrix contains NaN/Inf.")
@@ -161,7 +161,7 @@ def main():
     train_path, test_path, predictions_path = sys.argv[1], sys.argv[2], sys.argv[3]
     total_start = time.perf_counter()
 
-    print_header("PART (C) — TRAINING PIPELINE (ADAPTIVE MINI-GRID)")
+    print_header("PART (C) — TRAINING PIPELINE")
 
     # --- Step 1: Loading ---
     start = time.perf_counter()
@@ -181,28 +181,28 @@ def main():
 
     # --- Step 2: Extract & Expand ---
     start = time.perf_counter()
-    print_step(2, 6, "Building Base 20 & Cubic Feature Matrix (k=3)...")
+    print_step(2, 6, "Building Base & Polynomial Feature Matrix (Pure NumPy)...")
     
     Z_train_base, base_names = extract_base_features(X_train_raw, feature_columns)
     del X_train_raw
     
-    Z_train_poly, poly_names = expand_polynomials_cubic(Z_train_base, base_names)
+    Z_train_poly, poly_names = expand_polynomials(Z_train_base, base_names)
     del Z_train_base
     
     print_stat("Base Features", len(base_names))
-    print_stat("Expanded Cubic Features", Z_train_poly.shape[1])
+    print_stat("Expanded Poly Features", Z_train_poly.shape[1])
     print_time(start)
 
-    # --- Step 3: Standardize & Fast Lasso Prune ---
+    # --- Step 3: Standardize & Lasso Prune ---
     start = time.perf_counter()
-    print_step(3, 6, f"Standardizing & applying FAST Lasso Selection (tol={LASSO_TOL})...")
+    print_step(3, 6, f"Standardizing & applying Lasso Selection (alpha={LASSO_ALPHA})...")
     
     scaler = StandardScaler()
     Z_train_scaled = scaler.fit_transform(Z_train_poly)
     del Z_train_poly
     
     selector = SelectFromModel(
-        Lasso(alpha=LASSO_ALPHA, max_iter=LASSO_MAX_ITER, random_state=RANDOM_STATE, tol=LASSO_TOL), 
+        Lasso(alpha=LASSO_ALPHA, max_iter=LASSO_MAX_ITER, random_state=RANDOM_STATE, tol=0.001), 
         prefit=False
     )
     Z_train_selected = selector.fit_transform(Z_train_scaled, y_train)
@@ -212,13 +212,14 @@ def main():
     print_stat("Features Pruned", len(poly_names) - Z_train_selected.shape[1])
     print_time(start)
 
-    # --- Step 4: Adaptive Mini-Grid SGD Tuning (3-Fold) ---
+    # --- Step 4: SGD Tuning ---
     start = time.perf_counter()
-    print_step(4, 6, "Tuning SGDRegressor via 3-Fold Mini-Grid...")
+    print_step(4, 6, "Tuning SGDRegressor (epsilon-insensitive) via 5-Fold CV...")
 
+    # We use L2 penalty here because Lasso already handled the feature selection.
     param_grid = {
-        "alpha": [1e-4, 5e-4], 
-        "epsilon": [0.05, 0.1]
+        "alpha": [1e-4, 1e-3], 
+        "epsilon": [0.01, 0.05, 0.1]
     }
 
     grid_search = GridSearchCV(
@@ -226,7 +227,7 @@ def main():
         param_grid=param_grid,
         scoring="neg_mean_absolute_error", 
         cv=KFold(n_splits=CV_FOLDS, shuffle=True, random_state=RANDOM_STATE), 
-        n_jobs=1
+        n_jobs=-1
     )
     grid_search.fit(Z_train_selected, y_train)
     model, best_cv_mae = grid_search.best_estimator_, -grid_search.best_score_
@@ -248,9 +249,10 @@ def main():
     X_test_raw = test_df[feature_columns].to_numpy(dtype=np.float32)
     del test_df
 
+    # Extract base -> Expand -> Scale -> Select
     Z_test_base, _ = extract_base_features(X_test_raw, feature_columns)
     del X_test_raw
-    Z_test_poly, _ = expand_polynomials_cubic(Z_test_base, base_names)
+    Z_test_poly, _ = expand_polynomials(Z_test_base, base_names)
     del Z_test_base
 
     Z_test_selected = selector.transform(scaler.transform(Z_test_poly))
@@ -271,7 +273,7 @@ def main():
 
     # --- Final Summary ---
     print_header("FINAL SUMMARY")
-    print_stat("Algorithm", "SGDRegressor (Fast Cubic Ext. + Lasso + Mini-Grid)")
+    print_stat("Algorithm", "SGDRegressor (NumPy Polynomial Ext. + Lasso)")
     print_stat("Training NMAE", f"{train_nmae:.4f}")
     print_stat("Training NMSE", f"{train_nmse:.4f}")
     print_stat("Total Runtime", f"{time.perf_counter() - total_start:.2f}s")
