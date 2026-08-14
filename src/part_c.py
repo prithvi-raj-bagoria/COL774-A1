@@ -214,7 +214,7 @@ def main():
 
     # --- Step 4: SGD Tuning ---
     start = time.perf_counter()
-    print_step(4, 6, "Tuning SGDRegressor (epsilon-insensitive) via 5-Fold CV...")
+    print_step(4, 6, "Tuning SGDRegressor (huber) via 5-Fold CV...")
 
     # We use L2 penalty here because Lasso already handled the feature selection.
     param_grid = {
@@ -223,7 +223,7 @@ def main():
     }
 
     grid_search = GridSearchCV(
-        estimator=SGDRegressor(loss='epsilon_insensitive', penalty='l2', max_iter=2000, random_state=RANDOM_STATE),
+        estimator=SGDRegressor(loss='huber', penalty='l2', max_iter=2000, random_state=RANDOM_STATE),
         param_grid=param_grid,
         scoring="neg_mean_absolute_error", 
         cv=KFold(n_splits=CV_FOLDS, shuffle=True, random_state=RANDOM_STATE), 
