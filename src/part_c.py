@@ -11,15 +11,15 @@ from sklearn.model_selection import GridSearchCV, KFold
 # ------------------------------------------------------------
 RAW_FEATURES = 1640
 LASSO_ALPHA = 0.005
-LASSO_MAX_ITER = 1500
-LASSO_TOL = 1e-3          # relaxed for speed
+LASSO_MAX_ITER = 1000
+LASSO_TOL = 1e-2          # relaxed for speed
 CV_FOLDS = 3
 POLY_DEGREE = 2
 RANDOM_STATE = 42
-BASE_SELECT_K = 100       # no selection if base features < this
-LASSO_MAX_FEATURES = 600
+BASE_SELECT_K = 100      # no selection if base features < this
+LASSO_MAX_FEATURES = 1000
 SGD_ALPHAS = [1e-5, 1e-4, 1e-3, 1e-2]     # expanded grid
-SGD_EPSILONS = [0.01, 0.05, 0.1, 0.2]
+SGD_EPSILONS = [0.01, 0.1, 0.2, 0.5, 1]
 
 # ------------------------------------------------------------
 # Small helpers
@@ -329,17 +329,20 @@ def main():
     print(f"    expanded_features={Z.shape[1]}")
     print(f"    done in {time.perf_counter()-t:.2f}s")
 
-    # 3. Scaling + Lasso selection
+    # 3. Scaling + Lasso selection (with precompute=True)
     t = time.perf_counter()
     print("\n[3/6] Scaling + Lasso selection...")
     scaler = StandardScaler()
     Z = scaler.fit_transform(Z)
 
     selector = SelectFromModel(
-        Lasso(alpha=LASSO_ALPHA,
-              max_iter=LASSO_MAX_ITER,
-              tol=LASSO_TOL,
-              random_state=RANDOM_STATE),
+        Lasso(
+            alpha=LASSO_ALPHA,
+            max_iter=LASSO_MAX_ITER,
+            tol=LASSO_TOL,
+            random_state=RANDOM_STATE,
+            precompute=True
+        ),
         max_features=LASSO_MAX_FEATURES,
         threshold=-np.inf
     )
@@ -347,26 +350,19 @@ def main():
     print(f"    selected_features={Z.shape[1]}")
     print(f"    done in {time.perf_counter()-t:.2f}s")
 
-    # 4. SGD linear model CV (expanded grid)
+    # 4. Direct final linear model (no grid search)
     t = time.perf_counter()
-    print("\n[4/6] SGD linear-model CV...")
-    grid = GridSearchCV(
-        SGDRegressor(loss="epsilon_insensitive",
-                     penalty="l2",
-                     max_iter=2000,
-                     random_state=RANDOM_STATE),
-        {"alpha": SGD_ALPHAS, "epsilon": SGD_EPSILONS},
-        scoring="neg_mean_absolute_error",
-        cv=KFold(n_splits=CV_FOLDS, shuffle=True, random_state=RANDOM_STATE),
-        n_jobs=-1,
-        pre_dispatch=4
+    print("\n[4/6] Fitting final SGD model...")
+    model = SGDRegressor(
+        loss="epsilon_insensitive",
+        penalty="l2",
+        alpha=0.0001,
+        epsilon=0.2,
+        max_iter=2000,
+        random_state=RANDOM_STATE
     )
-    grid.fit(Z, y)
-
-    model = grid.best_estimator_
-    cv_mae = -grid.best_score_
-    print(f"    best_params={grid.best_params_}")
-    print(f"    CV_MAE={cv_mae:.6f}")
+    model.fit(Z, y)
+    print(f"    alpha={model.alpha}, epsilon={model.epsilon}")
     print(f"    done in {time.perf_counter()-t:.2f}s")
 
     # Training diagnostics
@@ -413,8 +409,7 @@ def main():
     print(f"Base features after selection: {len(names)}")
     print(f"Expanded features             : {len(poly_names)}")
     print(f"Selected features             : {Z_test.shape[1]}")
-    print(f"Best parameters               : {grid.best_params_}")
-    print(f"CV MAE                        : {cv_mae:.6f}")
+    print(f"Best parameters               : {model.get_params()}")
     print(f"Train NMAE                    : {train_nmae:.6f}")
     print(f"Train NMSE                    : {train_nmse:.6f}")
     print(f"Total runtime                 : {time.perf_counter()-total:.2f}s")
