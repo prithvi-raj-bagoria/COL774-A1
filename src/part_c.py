@@ -1,349 +1,375 @@
-import sys
-import time
+import sys, time
 import numpy as np
 import pandas as pd
 from sklearn.preprocessing import StandardScaler
-from sklearn.linear_model import SGDRegressor
-from sklearn.linear_model import Lasso
-from sklearn.feature_selection import SelectFromModel
+from sklearn.linear_model import Lasso, SGDRegressor
+from sklearn.feature_selection import SelectFromModel, SelectKBest, f_regression
 from sklearn.model_selection import GridSearchCV, KFold
 
-# ============================================================
-# 1. Configuration & Hyperparameters
-# ============================================================
-EXPECTED_RAW_FEATURES = 1640
+# ------------------------------------------------------------
+# Configuration
+# ------------------------------------------------------------
+RAW_FEATURES = 1640
 LASSO_ALPHA = 0.005
-LASSO_MAX_ITER = 1500
+LASSO_MAX_ITER = 2000
+LASSO_TOL = 1e-4
 CV_FOLDS = 3
+POLY_DEGREE = 2
 RANDOM_STATE = 42
+BASE_SELECT_K = 100          # number of base features kept before polynomial expansion
+LASSO_MAX_FEATURES = 600    # cap on final selected features
+SGD_ALPHAS = [1e-4, 1e-3]
+SGD_EPSILONS = [0.01, 0.05, 0.1]
 
-# ============================================================
-# 2. Terminal Output Helpers
-# ============================================================
-def print_header(title):
-    print("\n" + "=" * 60 + f"\n{title}\n" + "=" * 60)
+# ------------------------------------------------------------
+# Small helpers
+# ------------------------------------------------------------
+def sec(title):
+    print(f"\n{'='*64}\n{title}\n{'='*64}")
 
-def print_step(step_num, total_steps, description):
-    print(f"\n▶ [{step_num}/{total_steps}] {description}")
+def mean(x): return np.mean(x, axis=1, dtype=np.float32)
+def std(x): return np.std(x, axis=1, dtype=np.float32)
 
-def print_stat(label, value):
-    print(f"    ➜ {label:<20} : {value}")
+def skew(x):
+    m = np.mean(x, axis=1, keepdims=True, dtype=np.float32)
+    s = np.std(x, axis=1, keepdims=True, dtype=np.float32) + 1e-7
+    return np.mean(((x - m) / s) ** 3, axis=1, dtype=np.float32)
 
-def print_time(start_time):
-    print(f"    ⏱  Time taken          : {time.perf_counter() - start_time:.2f}s")
+def kurt(x):
+    m = np.mean(x, axis=1, keepdims=True, dtype=np.float32)
+    s = np.std(x, axis=1, keepdims=True, dtype=np.float32) + 1e-7
+    return np.mean(((x - m) / s) ** 4, axis=1, dtype=np.float32)
 
-# ============================================================
-# 3. Fast Vectorized Signal Math (Row-wise operations)
-# ============================================================
-def row_mean(x): return np.mean(x, axis=1, dtype=np.float32)
-def row_std(x): return np.std(x, axis=1, dtype=np.float32)
-
-def row_skewness(x):
-    mean = np.mean(x, axis=1, keepdims=True, dtype=np.float32)
-    std = np.std(x, axis=1, keepdims=True, dtype=np.float32) + 1e-7
-    return np.mean(((x - mean) / std) ** 3, axis=1, dtype=np.float32)
-
-def row_kurtosis(x):
-    mean = np.mean(x, axis=1, keepdims=True, dtype=np.float32)
-    std = np.std(x, axis=1, keepdims=True, dtype=np.float32) + 1e-7
-    return np.mean(((x - mean) / std) ** 4, axis=1, dtype=np.float32)
-
-def row_autocorr_lag(x, lag):
-    if x.shape[1] <= lag: return np.zeros(x.shape[0], dtype=np.float32)
+def zcross(x):
     c = x - np.mean(x, axis=1, keepdims=True, dtype=np.float32)
-    return (np.sum(c[:, :-lag] * c[:, lag:], axis=1) / (np.sum(c * c, axis=1) + 1e-10)).astype(np.float32)
+    return np.sum(c[:, :-1] * c[:, 1:] < 0, axis=1).astype(np.float32)
 
-def row_zero_crossings(x):
-    c = x - np.mean(x, axis=1, keepdims=True, dtype=np.float32)
-    return np.sum((c[:, :-1] * c[:, 1:]) < 0, axis=1).astype(np.float32)
-
-def row_local_extrema(x):
+def extrema(x):
     d = np.diff(x, axis=1)
-    return np.sum((d[:, :-1] * d[:, 1:]) < 0, axis=1).astype(np.float32)
+    return np.sum(d[:, :-1] * d[:, 1:] < 0, axis=1).astype(np.float32)
 
-def row_sma(x, y, z):
-    """Signal Magnitude Area: Actigraphy standard for physical exertion."""
+def ac_many(x, lags):
+    m = np.mean(x, axis=1, keepdims=True, dtype=np.float32)
+    c = x - m
+    den = np.sum(c * c, axis=1, dtype=np.float32) + 1e-10
+    out = np.empty((x.shape[0], len(lags)), dtype=np.float32)
+    for j, lag in enumerate(lags):
+        out[:, j] = np.sum(c[:, :-lag] * c[:, lag:], axis=1, dtype=np.float32) / den
+    return out
+
+def sma(x, y, z):
     return np.sum(np.abs(x) + np.abs(y) + np.abs(z), axis=1, dtype=np.float32)
 
-# --- NEW ADVANCED MATH HELPERS ---
-def row_tkeo_mean(x):
-    """Teager-Kaiser Energy Operator: Penalizes rapid, erratic motion shocks."""
-    if x.shape[1] < 3: return np.zeros(x.shape[0], dtype=np.float32)
-    tkeo = x[:, 1:-1]**2 - (x[:, :-2] * x[:, 2:])
-    return np.mean(tkeo, axis=1, dtype=np.float32)
+def tkeo(x):
+    if x.shape[1] < 3:
+        return np.zeros(x.shape[0], dtype=np.float32)
+    return np.mean(x[:, 1:-1] ** 2 - x[:, :-2] * x[:, 2:], axis=1, dtype=np.float32)
 
-def row_shannon_entropy(x):
-    """Fast Vectorized Shannon Entropy Proxy for Signal Quality Index (SQI)."""
-    mean = np.mean(x, axis=1, keepdims=True, dtype=np.float32)
-    std = np.std(x, axis=1, keepdims=True, dtype=np.float32) + 1e-7
-    z = (x - mean) / std
-    
-    # Vectorized bin probabilities
-    P = np.column_stack([
-        np.mean(z < -2, axis=1),
-        np.mean((z >= -2) & (z < -1), axis=1),
-        np.mean((z >= -1) & (z < 0), axis=1),
-        np.mean((z >= 0) & (z < 1), axis=1),
-        np.mean((z >= 1) & (z < 2), axis=1),
-        np.mean(z >= 2, axis=1)
-    ]) + 1e-10 # Prevent log(0)
-    
-    return -np.sum(P * np.log(P), axis=1).astype(np.float32)
+def entropy_proxy(x):
+    m = np.mean(x, axis=1, keepdims=True, dtype=np.float32)
+    s = np.std(x, axis=1, keepdims=True, dtype=np.float32) + 1e-7
+    z = (x - m) / s
+    p = np.empty((x.shape[0], 6), dtype=np.float32)
+    p[:, 0] = np.mean(z < -2, axis=1)
+    p[:, 1] = np.mean((z >= -2) & (z < -1), axis=1)
+    p[:, 2] = np.mean((z >= -1) & (z < 0), axis=1)
+    p[:, 3] = np.mean((z >= 0) & (z < 1), axis=1)
+    p[:, 4] = np.mean((z >= 1) & (z < 2), axis=1)
+    p[:, 5] = np.mean(z >= 2, axis=1)
+    p += 1e-10
+    return -np.sum(p * np.log(p), axis=1).astype(np.float32)
 
-def row_eda_phasic_energy(x):
-    """Isolates Phasic EDA (stress spikes) from Tonic EDA (baseline drift)."""
-    window = 8 # Approx 2 seconds if EDA is sampled at 4Hz
-    if x.shape[1] < window: return np.zeros(x.shape[0], dtype=np.float32)
-    
-    # Fast rolling average via cumulative sum
-    cs = np.cumsum(x, axis=1, dtype=np.float32)
-    tonic = (cs[:, window:] - cs[:, :-window]) / window
-    phasic = x[:, window:] - tonic
-    return np.sum(phasic**2, axis=1).astype(np.float32)
+def phasic_energy(x):
+    w = 8
+    if x.shape[1] < w:
+        return np.zeros(x.shape[0], dtype=np.float32)
+    cs = np.concatenate([np.zeros((x.shape[0], 1), dtype=np.float32),
+                         np.cumsum(x, axis=1, dtype=np.float32)], axis=1)
+    tonic = (cs[:, w:] - cs[:, :-w]) / w
+    phasic = x[:, w - 1:] - tonic
+    return np.sum(phasic ** 2, axis=1, dtype=np.float32)
 
-# ============================================================
-# 4. Feature Assembly Framework (Base & Polynomial)
-# ============================================================
-def extract_base_features(X_raw, feature_columns):
-    """Extracts a tight, highly curated set of advanced biological base features."""
-    features, names = [], []
-    
-    acc_x = X_raw[:, [i for i, c in enumerate(feature_columns) if c.startswith("acc_x_")]]
-    acc_y = X_raw[:, [i for i, c in enumerate(feature_columns) if c.startswith("acc_y_")]]
-    acc_z = X_raw[:, [i for i, c in enumerate(feature_columns) if c.startswith("acc_z_")]]
-    bvp = X_raw[:, [i for i, c in enumerate(feature_columns) if c.startswith("bvp_")]]
-    eda = X_raw[:, [i for i, c in enumerate(feature_columns) if c.startswith("eda_")]]
+def peak_count(bvp, fs=64):
+    """Count local maxima above a small threshold."""
+    m = np.mean(bvp, axis=1, keepdims=True, dtype=np.float32)
+    s = np.std(bvp, axis=1, keepdims=True, dtype=np.float32) + 1e-7
+    thr = m + 0.2 * s
+    maxima = ((bvp[:, 1:-1] > bvp[:, :-2]) &
+              (bvp[:, 1:-1] > bvp[:, 2:]) &
+              (bvp[:, 1:-1] > thr))
+    return maxima.sum(axis=1).astype(np.float32)
 
-    # Pre-compute derivatives for multiple feature sets
+# ------------------------------------------------------------
+# Feature extraction
+# ------------------------------------------------------------
+def extract_features(X, cols):
+    F, N = [], []
+    def add(x, name):
+        F.append(np.asarray(x, dtype=np.float32))
+        N.append(name)
+
+    prefixes = {"ax": "acc_x_", "ay": "acc_y_", "az": "acc_z_",
+                "bvp": "bvp_", "eda": "eda_"}
+    idx = {k: [i for i, c in enumerate(cols) if c.startswith(p)]
+           for k, p in prefixes.items()}
+
+    ax = X[:, idx["ax"]]
+    ay = X[:, idx["ay"]]
+    az = X[:, idx["az"]]
+    bvp = X[:, idx["bvp"]]
+    eda = X[:, idx["eda"]]
+
+    # ---- BVP features ----
+    bvp_std = std(bvp)
+    add(bvp_std, "bvp_std")
+    add(skew(bvp), "bvp_skew")
+    add(kurt(bvp), "bvp_kurt")
+    add(zcross(bvp), "bvp_zcross")
+    add(extrema(bvp), "bvp_extrema")
+    add(entropy_proxy(bvp), "bvp_entropy")
+
     vpg = np.diff(bvp, axis=1)
     apg = np.diff(vpg, axis=1)
+    vpg_std = std(vpg)
+    apg_std = std(apg)
 
-    # --- A. BVP Pulse Morphology & SQI ---
-    features.append(row_std(bvp)); names.append("bvp_std")
-    features.append(row_skewness(bvp)); names.append("bvp_skew")
-    features.append(row_kurtosis(bvp)); names.append("bvp_kurt")
-    features.append(row_zero_crossings(bvp)); names.append("bvp_zcross")
-    features.append(row_local_extrema(bvp)); names.append("bvp_extrema")
-    features.append(row_shannon_entropy(bvp)); names.append("bvp_entropy_sqi") # NEW: Signal Quality
+    add(vpg_std / (bvp_std + 1e-7), "bvp_hjorth_mobility")
+    add((apg_std / (vpg_std + 1e-7)) /
+        (vpg_std / (bvp_std + 1e-7) + 1e-7),
+        "bvp_hjorth_complexity")
 
-    # --- B. Hjorth Parameters (Waveform Complexity) ---
-    bvp_std_val = row_std(bvp) + 1e-7
-    vpg_std_val = row_std(vpg) + 1e-7
-    apg_std_val = row_std(apg) + 1e-7
-    
-    mobility_bvp = vpg_std_val / bvp_std_val
-    mobility_vpg = apg_std_val / vpg_std_val
-    complexity_bvp = mobility_vpg / (mobility_bvp + 1e-7)
-    
-    features.append(mobility_bvp); names.append("bvp_hjorth_mobility")      # NEW: Hjorth 1
-    features.append(complexity_bvp); names.append("bvp_hjorth_complexity")  # NEW: Hjorth 2
-
-    # --- C. Frequency Equalizer via Autocorrelation Bins ---
     bpm_targets = [50, 60, 70, 80, 90, 100, 110, 120, 130, 140, 150, 170]
-    for bpm in bpm_targets:
-        lag = int(60.0 * 64 / bpm)
-        features.append(row_autocorr_lag(bvp, lag))
-        names.append(f"bvp_ac_{bpm}bpm")
+    lags = [int(60 * 64 / bpm) for bpm in bpm_targets]
+    ac = ac_many(bvp, lags)
+    for j, bpm in enumerate(bpm_targets):
+        add(ac[:, j], f"bvp_ac_{bpm}")
 
-    # --- D. Non-FFT Frequency Proxies ---
-    features.append(row_zero_crossings(vpg)); names.append("vpg_zcross_freq")
-    features.append(row_zero_crossings(apg)); names.append("apg_zcross_freq")
-    
-    ac_energy_low = row_autocorr_lag(bvp, 32) + row_autocorr_lag(bvp, 38)
-    ac_energy_high = row_autocorr_lag(bvp, 16) + row_autocorr_lag(bvp, 22)
-    features.append(ac_energy_low); names.append("bvp_ac_energy_low")
-    features.append(ac_energy_high); names.append("bvp_ac_energy_high")
+    add(zcross(vpg), "vpg_zcross")
+    add(zcross(apg), "apg_zcross")
+    add(ac[:, 2] + ac[:, 3], "bvp_ac_low")
+    add(ac[:, 5] + ac[:, 6], "bvp_ac_high")
+    add(vpg_std, "vpg_std")
+    add(skew(vpg), "vpg_skew")
+    add(apg_std, "apg_std")
+    add(skew(apg), "apg_skew")
+    add(kurt(apg), "apg_kurt")
+    add(extrema(apg), "apg_extrema")
 
-    # --- E. VPG & Advanced APG Shape Statistics ---
-    features.append(vpg_std_val); names.append("vpg_std")
-    features.append(row_skewness(vpg)); names.append("vpg_skew")
-    
-    features.append(apg_std_val); names.append("apg_std")
-    features.append(row_skewness(apg)); names.append("apg_skew")
-    features.append(row_kurtosis(apg)); names.append("apg_kurt")
-    features.append(row_zero_crossings(apg)); names.append("apg_zcross")
-    features.append(row_local_extrema(apg)); names.append("apg_extrema")
-    
-    est_bpm = (np.sum((vpg[:, :-1] <= 0) & (vpg[:, 1:] > 0), axis=1) * 6.0).astype(np.float32)
-    features.append(est_bpm); names.append("vpg_est_bpm")
+    bpm_zc = (np.sum((vpg[:, :-1] <= 0) & (vpg[:, 1:] > 0), axis=1) * 6.0).astype(np.float32)
+    add(bpm_zc, "vpg_est_bpm")
+    add(peak_count(bvp) * 6.0, "bvp_peak_bpm")
 
-    # --- F. Context: Motion & TKEO Artifact Detection ---
-    acc_sma_val = row_sma(acc_x, acc_y, acc_z)
-    features.append(acc_sma_val); names.append("acc_sma")
-    
-    acc_sq = acc_x**2 + acc_y**2 + acc_z**2
-    features.append(row_std(acc_sq)); names.append("acc_sq_std")
-    
-    acc_tkeo_tot = row_tkeo_mean(acc_x) + row_tkeo_mean(acc_y) + row_tkeo_mean(acc_z)
-    features.append(acc_tkeo_tot); names.append("acc_tkeo_total") # NEW: Motion Shocks
+    # additional robust BVP features
+    add(np.max(bvp, axis=1) - np.min(bvp, axis=1), "bvp_range")
+    add(np.percentile(bvp, 75, axis=1).astype(np.float32) -
+        np.percentile(bvp, 25, axis=1).astype(np.float32), "bvp_iqr")
+    med = np.median(bvp, axis=1, keepdims=True)
+    add(np.median(np.abs(bvp - med), axis=1), "bvp_mad")
+    add(np.sqrt(np.mean(bvp ** 2, axis=1)), "bvp_rms")
 
-    # --- G. Stress: Phasic vs Tonic EDA ---
-    features.append(row_mean(eda)); names.append("eda_mean")
-    features.append(row_std(eda)); names.append("eda_std")
-    features.append(row_std(np.diff(eda, axis=1))); names.append("eda_diff_std")
-    features.append(row_eda_phasic_energy(eda)); names.append("eda_phasic_energy") # NEW: True Stress Spikes
+    # ---- Accelerometer features ----
+    acc_sq = ax ** 2 + ay ** 2 + az ** 2
+    add(sma(ax, ay, az), "acc_sma")
+    add(std(acc_sq), "acc_sq_std")
+    add(tkeo(ax) + tkeo(ay) + tkeo(az), "acc_tkeo")
 
-    # --- H. Temporal Context (Acceleration/Deceleration) ---
-    half_bvp = bvp.shape[1] // 2
-    half_acc = acc_x.shape[1] // 2
-    
-    features.append(row_std(bvp[:, :half_bvp])); names.append("bvp_std_h1")
-    features.append(row_std(bvp[:, half_bvp:])); names.append("bvp_std_h2")
-    features.append(row_sma(acc_x[:, :half_acc], acc_y[:, :half_acc], acc_z[:, :half_acc])); names.append("acc_sma_h1")
-    features.append(row_sma(acc_x[:, half_acc:], acc_y[:, half_acc:], acc_z[:, half_acc:])); names.append("acc_sma_h2")
+    acc_mag = np.sqrt(acc_sq)
+    add(mean(acc_mag), "acc_mag_mean")
+    add(std(acc_mag), "acc_mag_std")
 
-    Z_base = np.column_stack(features).astype(np.float32)
-    return Z_base, names
+    for name, arr in zip(["ax", "ay", "az"], [ax, ay, az]):
+        add(mean(arr), f"acc_{name}_mean")
+        add(std(arr), f"acc_{name}_std")
+        add(skew(arr), f"acc_{name}_skew")
+        add(kurt(arr), f"acc_{name}_kurt")
 
-def expand_polynomials(Z_base, names_base):
-    """
-    100% Legal Pure-NumPy Polynomial Expander.
-    Generates Degree-2 interactions (squared terms + cross-multiplications).
-    """
-    poly_features, poly_names = [], []
-    n_cols = Z_base.shape[1]
+    # ---- EDA features ----
+    add(mean(eda), "eda_mean")
+    add(std(eda), "eda_std")
+    add(std(np.diff(eda, axis=1)), "eda_diff_std")
+    add(phasic_energy(eda), "eda_phasic_energy")
+    add(np.min(eda, axis=1), "eda_min")
+    add(np.max(eda, axis=1), "eda_max")
+    add(np.max(eda, axis=1) - np.min(eda, axis=1), "eda_range")
+    add(skew(eda), "eda_skew")
+    add(kurt(eda), "eda_kurt")
+    add(mean(np.diff(eda, axis=1)), "eda_diff_mean")
 
-    # 1. Base Features (Degree 1)
-    for i in range(n_cols):
-        poly_features.append(Z_base[:, i])
-        poly_names.append(names_base[i])
+    # ---- Temporal context ----
+    hb = bvp.shape[1] // 2
+    ha = ax.shape[1] // 2
+    add(std(bvp[:, :hb]), "bvp_std_h1")
+    add(std(bvp[:, hb:]), "bvp_std_h2")
+    add(sma(ax[:, :ha], ay[:, :ha], az[:, :ha]), "acc_sma_h1")
+    add(sma(ax[:, ha:], ay[:, ha:], az[:, ha:]), "acc_sma_h2")
+    add(std(bvp[:, hb:]) / (std(bvp[:, :hb]) + 1e-7), "bvp_std_ratio_h2h1")
+    add(sma(ax[:, ha:], ay[:, ha:], az[:, ha:]) /
+        (sma(ax[:, :ha], ay[:, :ha], az[:, :ha]) + 1e-7),
+        "acc_sma_ratio_h2h1")
 
-    # 2. Interactions & Squared (Degree 2)
-    for i in range(n_cols):
-        for j in range(i, n_cols):
-            poly_features.append(Z_base[:, i] * Z_base[:, j])
-            if i == j:
-                poly_names.append(f"{names_base[i]}^2")
-            else:
-                poly_names.append(f"{names_base[i]}*{names_base[j]}")
+    Z = np.column_stack(F).astype(np.float32)
+    if not np.all(np.isfinite(Z)):
+        raise ValueError("Feature matrix contains NaN/Inf.")
+    return Z, N
 
-    Z_poly = np.column_stack(poly_features).astype(np.float32)
-    if not np.all(np.isfinite(Z_poly)): raise ValueError("Poly matrix contains NaN/Inf.")
-    return Z_poly, poly_names
+# ------------------------------------------------------------
+# Polynomial expansion (degree 2)
+# ------------------------------------------------------------
+def polynomial_expand(Z, names, degree=2):
+    n, p = Z.shape
+    count = p
+    if degree >= 2:
+        count += p * (p + 1) // 2
 
-# ============================================================
-# 5. Main Pipeline Execution
-# ============================================================
+    out = np.empty((n, count), dtype=np.float32)
+    out_names = list(names)
+    out[:, :p] = Z
+    col = p
+
+    if degree >= 2:
+        for i in range(p):
+            zi = Z[:, i]
+            for j in range(i, p):
+                out[:, col] = zi * Z[:, j]
+                out_names.append(f"{names[i]}^2" if i == j
+                                 else f"{names[i]}*{names[j]}")
+                col += 1
+
+    return out, out_names
+
+# ------------------------------------------------------------
+# Main pipeline
+# ------------------------------------------------------------
 def main():
-    if len(sys.argv) != 4: sys.exit("Usage: python3 part_c.py train.csv test.csv predictions.txt")
-    train_path, test_path, predictions_path = sys.argv[1], sys.argv[2], sys.argv[3]
-    total_start = time.perf_counter()
+    if len(sys.argv) != 4:
+        sys.exit("Usage: python3 part_c.py train.csv test.csv predictions.txt")
 
-    print_header("PART (C) — TRAINING PIPELINE (ADVANCED BIOSIGNALS)")
+    train_path, test_path, pred_path = sys.argv[1:4]
+    total = time.perf_counter()
+    sec("PART (C) — OPTIMIZED LINEAR PIPELINE")
 
-    # --- Step 1: Loading ---
-    start = time.perf_counter()
-    print_step(1, 6, "Loading raw training dataset...")
-    train_df = pd.read_csv(train_path)
-    feature_columns = [c for c in train_df.columns if c != "hr"]
-    if len(feature_columns) != EXPECTED_RAW_FEATURES: 
-        raise ValueError(f"Expected {EXPECTED_RAW_FEATURES} raw features, got {len(feature_columns)}")
-    
-    y_train = train_df["hr"].to_numpy(dtype=np.float64)
-    X_train_raw = train_df[feature_columns].to_numpy(dtype=np.float32)
-    del train_df
-    
-    print_stat("Samples Loaded", f"{len(y_train):,}")
-    print_stat("Raw Features", X_train_raw.shape[1])
-    print_time(start)
+    # 1. Load training data
+    t = time.perf_counter()
+    print("[1/6] Loading training data...")
+    df = pd.read_csv(train_path, dtype=np.float32)
+    cols = [c for c in df.columns if c != "hr"]
+    if len(cols) != RAW_FEATURES:
+        raise ValueError(f"Expected {RAW_FEATURES} raw features, got {len(cols)}")
+    y = df["hr"].to_numpy(dtype=np.float64)
+    X = df[cols].to_numpy(dtype=np.float32)
+    del df
+    print(f"    samples={len(y):,}, raw_features={X.shape[1]}")
+    print(f"    done in {time.perf_counter()-t:.2f}s")
 
-    # --- Step 2: Extract & Expand ---
-    start = time.perf_counter()
-    print_step(2, 6, "Building Base & Polynomial Feature Matrix (Pure NumPy)...")
-    
-    Z_train_base, base_names = extract_base_features(X_train_raw, feature_columns)
-    del X_train_raw
-    
-    Z_train_poly, poly_names = expand_polynomials(Z_train_base, base_names)
-    del Z_train_base
-    
-    print_stat("Base Features", len(base_names))
-    print_stat("Expanded Poly Features", Z_train_poly.shape[1])
-    print_time(start)
+    # 2. Feature engineering
+    t = time.perf_counter()
+    print("\n[2/6] Feature engineering...")
+    Z, names = extract_features(X, cols)
+    del X
+    print(f"    base_features={Z.shape[1]}")
 
-    # --- Step 3: Standardize & Lasso Prune ---
-    start = time.perf_counter()
-    print_step(3, 6, f"Standardizing & applying Lasso Selection (alpha={LASSO_ALPHA})...")
-    
+    # Optional supervised pre-selection of base features
+    if BASE_SELECT_K is not None and BASE_SELECT_K < Z.shape[1]:
+        select_k = SelectKBest(f_regression, k=BASE_SELECT_K)
+        Z = select_k.fit_transform(Z, y)
+        selected_idx = select_k.get_support(indices=True)
+        names = [names[i] for i in selected_idx]
+        print(f"    after SelectKBest(k={BASE_SELECT_K}) base_features={Z.shape[1]}")
+
+    Z, poly_names = polynomial_expand(Z, names, degree=POLY_DEGREE)
+    print(f"    expanded_features={Z.shape[1]}")
+    print(f"    done in {time.perf_counter()-t:.2f}s")
+
+    # 3. Scaling + Lasso selection
+    t = time.perf_counter()
+    print("\n[3/6] Scaling + Lasso selection...")
     scaler = StandardScaler()
-    Z_train_scaled = scaler.fit_transform(Z_train_poly)
-    del Z_train_poly
-    
+    Z = scaler.fit_transform(Z)
+
     selector = SelectFromModel(
-        Lasso(alpha=LASSO_ALPHA, max_iter=LASSO_MAX_ITER, random_state=RANDOM_STATE, tol=0.001), 
-        prefit=False
+        Lasso(alpha=LASSO_ALPHA,
+              max_iter=LASSO_MAX_ITER,
+              tol=LASSO_TOL,
+              random_state=RANDOM_STATE),
+        max_features=LASSO_MAX_FEATURES,
+        threshold=-np.inf
     )
-    Z_train_selected = selector.fit_transform(Z_train_scaled, y_train)
-    del Z_train_scaled
-    
-    print_stat("Features Retained", Z_train_selected.shape[1])
-    print_stat("Features Pruned", len(poly_names) - Z_train_selected.shape[1])
-    print_time(start)
+    Z = selector.fit_transform(Z, y)
+    print(f"    selected_features={Z.shape[1]}")
+    print(f"    done in {time.perf_counter()-t:.2f}s")
 
-    # --- Step 4: SGD Tuning ---
-    start = time.perf_counter()
-    print_step(4, 6, "Tuning SGDRegressor (epsilon-insensitive) via 5-Fold CV...")
-
-    param_grid = {
-        "alpha": [1e-4, 1e-3], 
-        "epsilon": [0.01, 0.05, 0.1]
-    }
-
-    grid_search = GridSearchCV(
-        estimator=SGDRegressor(loss='epsilon_insensitive', penalty='l2', max_iter=2000, random_state=RANDOM_STATE),
-        param_grid=param_grid,
-        scoring="neg_mean_absolute_error", 
-        cv=KFold(n_splits=CV_FOLDS, shuffle=True, random_state=RANDOM_STATE), 
-        n_jobs=-1
+    # 4. SGD linear model CV
+    t = time.perf_counter()
+    print("\n[4/6] SGD linear-model CV...")
+    grid = GridSearchCV(
+        SGDRegressor(loss="epsilon_insensitive",
+                     penalty="l2",
+                     max_iter=2000,
+                     random_state=RANDOM_STATE),
+        {"alpha": SGD_ALPHAS, "epsilon": SGD_EPSILONS},
+        scoring="neg_mean_absolute_error",
+        cv=KFold(n_splits=CV_FOLDS, shuffle=True, random_state=RANDOM_STATE),
+        n_jobs=-1,
+        pre_dispatch=4
     )
-    grid_search.fit(Z_train_selected, y_train)
-    model, best_cv_mae = grid_search.best_estimator_, -grid_search.best_score_
-    
-    print_stat("Best Params", f"alpha={grid_search.best_params_['alpha']}, epsilon={grid_search.best_params_['epsilon']}")
-    print_stat("Best CV MAE", f"{best_cv_mae:.4f}")
-    print_time(start)
+    grid.fit(Z, y)
 
-    train_preds = model.predict(Z_train_selected)
-    train_nmae = np.sum(np.abs(y_train - train_preds)) / np.sum(np.abs(y_train - np.mean(y_train)))
-    train_nmse = np.sum((y_train - train_preds) ** 2) / np.sum((y_train - np.mean(y_train)) ** 2)
-    del train_preds, y_train, Z_train_selected
+    model = grid.best_estimator_
+    cv_mae = -grid.best_score_
+    print(f"    best_params={grid.best_params_}")
+    print(f"    CV_MAE={cv_mae:.6f}")
+    print(f"    done in {time.perf_counter()-t:.2f}s")
 
-    # --- Step 5: Process Test Data ---
-    print_header("PART (C) — TEST PREDICTIONS")
-    start = time.perf_counter()
-    print_step(5, 6, "Loading and formatting test set...")
-    test_df = pd.read_csv(test_path)
-    X_test_raw = test_df[feature_columns].to_numpy(dtype=np.float32)
-    del test_df
+    # Training diagnostics
+    pred = model.predict(Z)
+    mean_y = y.mean()
+    train_nmae = np.abs(y - pred).sum() / np.abs(y - mean_y).sum()
+    train_nmse = ((y - pred) ** 2).sum() / ((y - mean_y) ** 2).sum()
+    print(f"    train_NMAE={train_nmae:.6f}")
+    print(f"    train_NMSE={train_nmse:.6f}")
+    del pred, Z, y
 
-    Z_test_base, _ = extract_base_features(X_test_raw, feature_columns)
-    del X_test_raw
-    Z_test_poly, _ = expand_polynomials(Z_test_base, base_names)
-    del Z_test_base
+    # 5. Test feature extraction
+    t = time.perf_counter()
+    print("\n[5/6] Processing test data...")
+    df = pd.read_csv(test_path, dtype=np.float32)
+    X = df[cols].to_numpy(dtype=np.float32)
+    del df
 
-    Z_test_selected = selector.transform(scaler.transform(Z_test_poly))
-    del Z_test_poly
-    
-    print_stat("Test Samples", f"{Z_test_selected.shape[0]:,}")
-    print_time(start)
+    Z_test, _ = extract_features(X, cols)
+    del X
 
-    # --- Step 6: Execute ---
-    start = time.perf_counter()
-    print_step(6, 6, "Executing model predictions...")
-    predictions = model.predict(Z_test_selected)
-    if not np.all(np.isfinite(predictions)): raise ValueError("Predictions contain NaN/Inf.")
-    
-    np.savetxt(predictions_path, predictions, fmt="%.10f")
-    print_stat("Predictions Saved To", predictions_path)
-    print_time(start)
+    if BASE_SELECT_K is not None and BASE_SELECT_K < Z_test.shape[1]:
+        Z_test = select_k.transform(Z_test)
 
-    # --- Final Summary ---
-    print_header("FINAL SUMMARY")
-    print_stat("Algorithm", "SGDRegressor (NumPy Polynomial Ext. + Lasso)")
-    print_stat("Training NMAE", f"{train_nmae:.4f}")
-    print_stat("Training NMSE", f"{train_nmse:.4f}")
-    print_stat("Total Runtime", f"{time.perf_counter() - total_start:.2f}s")
-    print("\nNote: Official Public/Private NMAE will be calculated by the grading script.\n" + "=" * 60)
+    Z_test, _ = polynomial_expand(Z_test, names, degree=POLY_DEGREE)
+    Z_test = selector.transform(scaler.transform(Z_test))
+    print(f"    test_samples={Z_test.shape[0]:,}")
+    print(f"    final_features={Z_test.shape[1]}")
+    print(f"    done in {time.perf_counter()-t:.2f}s")
+
+    # 6. Predict
+    t = time.perf_counter()
+    print("\n[6/6] Generating predictions...")
+    pred = model.predict(Z_test)
+    if not np.all(np.isfinite(pred)):
+        raise ValueError("Predictions contain NaN/Inf.")
+    np.savetxt(pred_path, pred, fmt="%.10f")
+    print(f"    saved={len(pred):,}")
+    print(f"    file={pred_path}")
+    print(f"    done in {time.perf_counter()-t:.2f}s")
+
+    # Summary
+    sec("FINAL SUMMARY")
+    print(f"Base features after selection: {len(names)}")
+    print(f"Expanded features             : {len(poly_names)}")
+    print(f"Selected features             : {Z_test.shape[1]}")
+    print(f"Best parameters               : {grid.best_params_}")
+    print(f"CV MAE                        : {cv_mae:.6f}")
+    print(f"Train NMAE                    : {train_nmae:.6f}")
+    print(f"Train NMSE                    : {train_nmse:.6f}")
+    print(f"Total runtime                 : {time.perf_counter()-total:.2f}s")
+    print("\nPublic NMAE/NMSE are computed by the official evaluator.")
 
 if __name__ == "__main__":
     main()
