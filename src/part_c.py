@@ -163,7 +163,10 @@ def extract_features(X_raw, feature_columns):
     snr = np.var(bvp, axis=1) / (np.var(acc_sq, axis=1) + 1e-5)
     add_feat(features, names, snr, "time_domain_snr")
 
-    # --- F. Stack to Final 2D Array ---
+    # --- F. FUSION: Stack Raw + Engineered Features ---
+    features.append(X_raw)
+    names.extend(feature_columns)
+
     Z = np.column_stack(features).astype(np.float32)
     if not np.all(np.isfinite(Z)): raise ValueError("Feature matrix contains NaN or Inf.")
     return Z, names
@@ -200,7 +203,7 @@ def main():
     Z_train, feature_names = extract_features(X_train_raw, feature_columns)
     del X_train_raw
     
-    print_stat("Matrix Shape", f"{Z_train.shape[0]:,} x {Z_train.shape[1]:,}")
+    print_stat("Matrix Shape (Fusion)", f"{Z_train.shape[0]:,} x {Z_train.shape[1]:,}")
     print_time(start)
 
     # --- Step 3: Lasso Feature Pruning ---
@@ -226,11 +229,10 @@ def main():
     # --- Step 4: SGDRegressor Tuning (The Fast Hybrid) ---
     start = time.perf_counter()
     print_step(4, 6, "Tuning SGDRegressor (epsilon-insensitive) via 5-Fold CV...")
-    
-    # alpha is like 1/C. We test a few regularization strengths and epsilon buffers.
+
     param_grid = {
-        "alpha": [0.0001, 0.001, 0.01, 0.1], 
-        "epsilon": [0.0, 0.1, 0.2]
+        "alpha": [1e-6, 1e-5, 1e-4, 5e-4], 
+        "epsilon": [0.0, 0.01, 0.05, 0.1]
     }
 
     grid_search = GridSearchCV(
@@ -282,7 +284,7 @@ def main():
 
     # --- Final Summary ---
     print_header("FINAL SUMMARY")
-    print_stat("Algorithm", "LinearSVR (with Lasso pre-selection)")
+    print_stat("Algorithm", "SGDRegressor (Hybrid with Lasso pre-selection)")
     print_stat("Training NMAE", f"{train_nmae:.4f}")
     print_stat("Training NMSE", f"{train_nmse:.4f}")
     print_stat("Total Runtime", f"{time.perf_counter() - total_start:.2f}s")
