@@ -9,12 +9,13 @@ from sklearn.feature_selection import SelectFromModel
 from sklearn.model_selection import GridSearchCV, KFold
 
 # ============================================================
-# 1. Configuration & Hyperparameters
+# 1. Configuration & Hyperparameters (Adaptive Mini-Grid)
 # ============================================================
 EXPECTED_RAW_FEATURES = 1640
 LASSO_ALPHA = 0.005
-LASSO_MAX_ITER = 5000
-CV_FOLDS = 5
+LASSO_MAX_ITER = 1000  # Drastically reduced for speed
+LASSO_TOL = 0.01       # Loosened tolerance to force early stopping
+CV_FOLDS = 3           # Fast 3-fold cross validation for adaptability
 RANDOM_STATE = 42
 
 # ============================================================
@@ -160,7 +161,7 @@ def main():
     train_path, test_path, predictions_path = sys.argv[1], sys.argv[2], sys.argv[3]
     total_start = time.perf_counter()
 
-    print_header("PART (C) — TRAINING PIPELINE")
+    print_header("PART (C) — TRAINING PIPELINE (ADAPTIVE MINI-GRID)")
 
     # --- Step 1: Loading ---
     start = time.perf_counter()
@@ -192,16 +193,16 @@ def main():
     print_stat("Expanded Cubic Features", Z_train_poly.shape[1])
     print_time(start)
 
-    # --- Step 3: Standardize & Lasso Prune ---
+    # --- Step 3: Standardize & Fast Lasso Prune ---
     start = time.perf_counter()
-    print_step(3, 6, f"Standardizing & applying Lasso Selection (alpha={LASSO_ALPHA})...")
+    print_step(3, 6, f"Standardizing & applying FAST Lasso Selection (tol={LASSO_TOL})...")
     
     scaler = StandardScaler()
     Z_train_scaled = scaler.fit_transform(Z_train_poly)
     del Z_train_poly
     
     selector = SelectFromModel(
-        Lasso(alpha=LASSO_ALPHA, max_iter=LASSO_MAX_ITER, random_state=RANDOM_STATE, tol=0.001), 
+        Lasso(alpha=LASSO_ALPHA, max_iter=LASSO_MAX_ITER, random_state=RANDOM_STATE, tol=LASSO_TOL), 
         prefit=False
     )
     Z_train_selected = selector.fit_transform(Z_train_scaled, y_train)
@@ -211,13 +212,13 @@ def main():
     print_stat("Features Pruned", len(poly_names) - Z_train_selected.shape[1])
     print_time(start)
 
-    # --- Step 4: SGD Tuning ---
+    # --- Step 4: Adaptive Mini-Grid SGD Tuning (3-Fold) ---
     start = time.perf_counter()
-    print_step(4, 6, "Tuning SGDRegressor (epsilon-insensitive) via 5-Fold CV...")
+    print_step(4, 6, "Tuning SGDRegressor via 3-Fold Mini-Grid...")
 
     param_grid = {
-        "alpha": [1e-4, 1e-3], 
-        "epsilon": [0.01, 0.05, 0.1]
+        "alpha": [1e-4, 5e-4], 
+        "epsilon": [0.05, 0.1]
     }
 
     grid_search = GridSearchCV(
@@ -270,7 +271,7 @@ def main():
 
     # --- Final Summary ---
     print_header("FINAL SUMMARY")
-    print_stat("Algorithm", "SGDRegressor (Cubic Polynomial Ext. + Lasso)")
+    print_stat("Algorithm", "SGDRegressor (Fast Cubic Ext. + Lasso + Mini-Grid)")
     print_stat("Training NMAE", f"{train_nmae:.4f}")
     print_stat("Training NMSE", f"{train_nmse:.4f}")
     print_stat("Total Runtime", f"{time.perf_counter() - total_start:.2f}s")
