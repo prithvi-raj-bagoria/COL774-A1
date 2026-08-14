@@ -3,7 +3,7 @@ import numpy as np
 import pandas as pd
 
 from sklearn.preprocessing import StandardScaler
-from sklearn.svm import LinearSVR
+from sklearn.linear_model import Lasso
 from sklearn.model_selection import GridSearchCV, KFold
 
 # ============================================================
@@ -195,24 +195,22 @@ def main():
     Z_train, _ = extract_features(X_train_raw, feature_columns)
     del X_train_raw
 
-    print("Scaling features and fitting LinearSVR (pure L1 loss)...")
+    print("Scaling features and fitting Lasso...")
     scaler = StandardScaler()
     Z_train_scaled = scaler.fit_transform(Z_train)
     del Z_train
 
-    print("Tuning hyperparameters using 5-Fold GridSearchCV...")
+    print("Tuning hyperparameters using 5-Fold GridSearchCV with Lasso...")
     # Set up robust cross-validation splits
     cv_strategy = KFold(n_splits=5, shuffle=True, random_state=42)
 
     # Define the search grid with well-reasoned values
     param_grid = {
-        'C': [0.1, 1.0, 10.0],
-        'epsilon': [0.0, 0.1, 0.5]
+        'alpha': [0.0001, 0.001, 0.01, 0.1, 1.0]
     }
 
-    # Configure GridSearchCV (n_jobs=-1 uses all CPU cores to speed things up)
     grid_search = GridSearchCV(
-        estimator=LinearSVR(max_iter=5000, random_state=42),
+        estimator=Lasso(max_iter=5000, random_state=42),
         param_grid=param_grid,
         scoring='neg_mean_squared_error',
         cv=cv_strategy,
