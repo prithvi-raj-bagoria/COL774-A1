@@ -4,7 +4,7 @@ import pandas as pd
 
 from sklearn.preprocessing import StandardScaler
 from sklearn.linear_model import Lasso
-from sklearn.model_selection import GridSearchCV, KFold
+from sklearn.linear_model import LassoCV
 
 # ============================================================
 # Configuration & Constants
@@ -200,31 +200,17 @@ def main():
     Z_train_scaled = scaler.fit_transform(Z_train)
     del Z_train
 
-    print("Tuning hyperparameters using 5-Fold GridSearchCV with Lasso...")
-    # Set up robust cross-validation splits
-    cv_strategy = KFold(n_splits=5, shuffle=True, random_state=42)
-
-    # Define the search grid with well-reasoned values
-    param_grid = {
-        'alpha': [0.0001, 0.001, 0.01, 0.1, 1.0]
-    }
-
-    grid_search = GridSearchCV(
-        estimator=Lasso(max_iter=5000, random_state=42),
-        param_grid=param_grid,
-        scoring='neg_mean_squared_error',
-        cv=cv_strategy,
+    print("Fitting LassoCV with internal 5-Fold cross-validation...")
+    model = LassoCV(
+        alphas=[0.0001, 0.001, 0.01, 0.1, 1.0],
+        cv=5,
+        max_iter=5000,
+        random_state=42,
         n_jobs=-1
     )
 
-    # Fit the grid search on training data only
-    grid_search.fit(Z_train_scaled, y_train)
-
-    print(f"Best Parameters Found: {grid_search.best_params_}")
-    print(f"Best CV Score (Neg MSE): {grid_search.best_score_:.4f}")
-
-    # Extract the best estimator to use for test predictions
-    model = grid_search.best_estimator_
+    model.fit(Z_train_scaled, y_train)
+    print(f"Best Alpha Found: {model.alpha_}")
 
     del Z_train_scaled, y_train
 
