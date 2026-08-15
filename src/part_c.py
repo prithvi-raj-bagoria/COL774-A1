@@ -1,127 +1,176 @@
 import sys, time
 import numpy as np
 import pandas as pd
-import itertools
-from math import comb
-from collections import Counter
-from functools import partial
+
 from sklearn.preprocessing import StandardScaler
 from sklearn.linear_model import Lasso, SGDRegressor
-from sklearn.feature_selection import SelectFromModel, SelectKBest, mutual_info_regression
+from sklearn.feature_selection import SelectFromModel
 from sklearn.model_selection import GridSearchCV, KFold
+from sklearn.pipeline import Pipeline
 
 # ------------------------------------------------------------
 # Configuration
 # ------------------------------------------------------------
 RAW_FEATURES = 1640
+
+# Lasso feature selection
 LASSO_ALPHA = 0.005
 LASSO_MAX_ITER = 1000
-LASSO_TOL = 1e-3          # relaxed for speed
+LASSO_TOL = 1e-2
+LASSO_MAX_FEATURES = 500
+
+# Final SGD model hyperparameters
+SGD_ALPHAS = [1e-5, 1e-4, 1e-3, 1e-2]
+SGD_EPSILONS = [0.01, 0.1, 0.2]
 CV_FOLDS = 3
-POLY_DEGREE = 3
 RANDOM_STATE = 42
-BASE_SELECT_K = 50      # no selection if base features < this
-LASSO_MAX_FEATURES = 1000
-SGD_ALPHAS = [1e-5, 1e-4, 1e-3, 1e-2]     # expanded grid
-SGD_EPSILONS = [0.01, 0.1, 0.2, 0.5, 1]
 
 # ------------------------------------------------------------
-# Small helpers
+# Small mathematical helpers
 # ------------------------------------------------------------
 def sec(title):
     print(f"\n{'='*64}\n{title}\n{'='*64}")
 
-def mean(x): return np.mean(x, axis=1, dtype=np.float32)
-def std(x): return np.std(x, axis=1, dtype=np.float32)
+def mean(x):
+    """Mean along axis=1 (per row)."""
+    return np.mean(x, axis=1, dtype=np.float64)
+
+def std(x):
+    """Standard deviation along axis=1 (per row)."""
+    return np.std(x, axis=1, dtype=np.float64)
 
 def skew(x):
-    m = np.mean(x, axis=1, keepdims=True, dtype=np.float32)
-    s = np.std(x, axis=1, keepdims=True, dtype=np.float32) + 1e-7
-    return np.mean(((x - m) / s) ** 3, axis=1, dtype=np.float32)
+    """
+    Skewness = E[ ((x - mu) / sigma)^3 ]
+    Measures asymmetry of the distribution.
+    """
+    m = np.mean(x, axis=1, keepdims=True, dtype=np.float64)
+    s = np.std(x, axis=1, keepdims=True, dtype=np.float64) + 1e-7
+    return np.mean(((x - m) / s) ** 3, axis=1, dtype=np.float64)
 
 def kurt(x):
-    m = np.mean(x, axis=1, keepdims=True, dtype=np.float32)
-    s = np.std(x, axis=1, keepdims=True, dtype=np.float32) + 1e-7
-    return np.mean(((x - m) / s) ** 4, axis=1, dtype=np.float32)
+    """
+    Kurtosis = E[ ((x - mu) / sigma)^4 ]
+    Measures tailedness / peakedness.
+    """
+    m = np.mean(x, axis=1, keepdims=True, dtype=np.float64)
+    s = np.std(x, axis=1, keepdims=True, dtype=np.float64) + 1e-7
+    return np.mean(((x - m) / s) ** 4, axis=1, dtype=np.float64)
 
 def zcross(x):
-    c = x - np.mean(x, axis=1, keepdims=True, dtype=np.float32)
-    return np.sum(c[:, :-1] * c[:, 1:] < 0, axis=1).astype(np.float32)
+    """
+    Zero crossing rate after mean removal.
+    Count of sign changes in centered signal.
+    """
+    c = x - np.mean(x, axis=1, keepdims=True, dtype=np.float64)
+    return np.sum(c[:, :-1] * c[:, 1:] < 0, axis=1).astype(np.float64)
 
 def extrema(x):
+    """
+    Count local extrema from sign changes of first difference.
+    """
     d = np.diff(x, axis=1)
-    return np.sum(d[:, :-1] * d[:, 1:] < 0, axis=1).astype(np.float32)
+    return np.sum(d[:, :-1] * d[:, 1:] < 0, axis=1).astype(np.float64)
 
 def ac_many(x, lags):
-    m = np.mean(x, axis=1, keepdims=True, dtype=np.float32)
+    """
+    Autocorrelation at given lags:
+        R(k) = sum_t (x_t - mu)(x_{t+k} - mu) / sum_t (x_t - mu)^2
+    """
+    m = np.mean(x, axis=1, keepdims=True, dtype=np.float64)
     c = x - m
-    den = np.sum(c * c, axis=1, dtype=np.float32) + 1e-10
-    out = np.empty((x.shape[0], len(lags)), dtype=np.float32)
+    den = np.sum(c * c, axis=1, dtype=np.float64) + 1e-10
+    out = np.empty((x.shape[0], len(lags)), dtype=np.float64)
     for j, lag in enumerate(lags):
-        out[:, j] = np.sum(c[:, :-lag] * c[:, lag:], axis=1, dtype=np.float32) / den
+        out[:, j] = np.sum(c[:, :-lag] * c[:, lag:], axis=1, dtype=np.float64) / den
     return out
 
 def sma(x, y, z):
-    return np.sum(np.abs(x) + np.abs(y) + np.abs(z), axis=1, dtype=np.float32)
+    """
+    Signal Magnitude Area = sum( |x| + |y| + |z| )
+    """
+    return np.sum(np.abs(x) + np.abs(y) + np.abs(z), axis=1, dtype=np.float64)
 
 def tkeo(x):
+    """
+    Teager-Kaiser Energy Operator: x_t^2 - x_{t-1} x_{t+1}
+    Averaged over time.
+    """
     if x.shape[1] < 3:
-        return np.zeros(x.shape[0], dtype=np.float32)
-    return np.mean(x[:, 1:-1] ** 2 - x[:, :-2] * x[:, 2:], axis=1, dtype=np.float32)
+        return np.zeros(x.shape[0], dtype=np.float64)
+    return np.mean(x[:, 1:-1] ** 2 - x[:, :-2] * x[:, 2:], axis=1, dtype=np.float64)
 
 def entropy_proxy(x):
-    m = np.mean(x, axis=1, keepdims=True, dtype=np.float32)
-    s = np.std(x, axis=1, keepdims=True, dtype=np.float32) + 1e-7
+    """
+    A simple distribution entropy estimator:
+    Divide z-scored signal into bins and compute Shannon entropy.
+    """
+    m = np.mean(x, axis=1, keepdims=True, dtype=np.float64)
+    s = np.std(x, axis=1, keepdims=True, dtype=np.float64) + 1e-7
     z = (x - m) / s
-    p = np.empty((x.shape[0], 6), dtype=np.float32)
+
+    p = np.empty((x.shape[0], 6), dtype=np.float64)
     p[:, 0] = np.mean(z < -2, axis=1)
     p[:, 1] = np.mean((z >= -2) & (z < -1), axis=1)
     p[:, 2] = np.mean((z >= -1) & (z < 0), axis=1)
     p[:, 3] = np.mean((z >= 0) & (z < 1), axis=1)
     p[:, 4] = np.mean((z >= 1) & (z < 2), axis=1)
     p[:, 5] = np.mean(z >= 2, axis=1)
+
     p += 1e-10
-    return -np.sum(p * np.log(p), axis=1).astype(np.float32)
+    return -np.sum(p * np.log(p), axis=1).astype(np.float64)
 
 def phasic_energy(x):
+    """
+    Phasic energy = sum( (x - moving_average)^2 )
+    Moving average window w=8 removes slow tonic component.
+    """
     w = 8
     if x.shape[1] < w:
-        return np.zeros(x.shape[0], dtype=np.float32)
-    cs = np.concatenate([np.zeros((x.shape[0], 1), dtype=np.float32),
-                         np.cumsum(x, axis=1, dtype=np.float32)], axis=1)
+        return np.zeros(x.shape[0], dtype=np.float64)
+    cs = np.concatenate(
+        [np.zeros((x.shape[0], 1), dtype=np.float64),
+         np.cumsum(x, axis=1, dtype=np.float64)], axis=1
+    )
     tonic = (cs[:, w:] - cs[:, :-w]) / w
     phasic = x[:, w - 1:] - tonic
-    return np.sum(phasic ** 2, axis=1, dtype=np.float32)
+    return np.sum(phasic ** 2, axis=1, dtype=np.float64)
 
 def peak_count(bvp, fs=64):
-    """Count local maxima above a small threshold."""
-    m = np.mean(bvp, axis=1, keepdims=True, dtype=np.float32)
-    s = np.std(bvp, axis=1, keepdims=True, dtype=np.float32) + 1e-7
+    """
+    Count local maxima above mean + 0.2*std.
+    Used for BPM estimate.
+    """
+    m = np.mean(bvp, axis=1, keepdims=True, dtype=np.float64)
+    s = np.std(bvp, axis=1, keepdims=True, dtype=np.float64) + 1e-7
     thr = m + 0.2 * s
     maxima = ((bvp[:, 1:-1] > bvp[:, :-2]) &
               (bvp[:, 1:-1] > bvp[:, 2:]) &
               (bvp[:, 1:-1] > thr))
-    return maxima.sum(axis=1).astype(np.float32)
+    return maxima.sum(axis=1).astype(np.float64)
 
 def rr_features(bvp, fs=64):
-    """Compute RR interval statistics from BVP peak locations."""
-    m = np.mean(bvp, axis=1, keepdims=True, dtype=np.float32)
-    s = np.std(bvp, axis=1, keepdims=True, dtype=np.float32) + 1e-7
+    """
+    Compute RR interval statistics from detected BVP peaks.
+    RR intervals in milliseconds.
+    """
+    m = np.mean(bvp, axis=1, keepdims=True, dtype=np.float64)
+    s = np.std(bvp, axis=1, keepdims=True, dtype=np.float64) + 1e-7
     thr = m + 0.2 * s
     is_peak = ((bvp[:, 1:-1] > bvp[:, :-2]) &
                (bvp[:, 1:-1] > bvp[:, 2:]) &
                (bvp[:, 1:-1] > thr))
 
     n = bvp.shape[0]
-    rr_mean = np.zeros(n, dtype=np.float32)
-    rr_std = np.zeros(n, dtype=np.float32)
-    rr_rmssd = np.zeros(n, dtype=np.float32)
-    rr_median = np.zeros(n, dtype=np.float32)
+    rr_mean = np.zeros(n, dtype=np.float64)
+    rr_std = np.zeros(n, dtype=np.float64)
+    rr_rmssd = np.zeros(n, dtype=np.float64)
+    rr_median = np.zeros(n, dtype=np.float64)
 
     for i in range(n):
-        idx = np.where(is_peak[i])[0] + 1   # +1 because is_peak excludes first/last sample
+        idx = np.where(is_peak[i])[0] + 1
         if len(idx) >= 2:
-            rr = np.diff(idx) / fs * 1000.0   # milliseconds
+            rr = np.diff(idx) / fs * 1000.0
             rr_mean[i] = np.mean(rr)
             rr_std[i] = np.std(rr)
             rr_median[i] = np.median(rr)
@@ -133,9 +182,14 @@ def rr_features(bvp, fs=64):
 # Feature extraction
 # ------------------------------------------------------------
 def extract_features(X, cols):
+    """
+    Convert raw 1640 measurements into manually engineered features.
+    All features are computed with NumPy only.
+    """
     F, N = [], []
+
     def add(x, name):
-        F.append(np.asarray(x, dtype=np.float32))
+        F.append(np.asarray(x, dtype=np.float64))
         N.append(name)
 
     prefixes = {"ax": "acc_x_", "ay": "acc_y_", "az": "acc_z_",
@@ -149,7 +203,7 @@ def extract_features(X, cols):
     bvp = X[:, idx["bvp"]]
     eda = X[:, idx["eda"]]
 
-    # ---- BVP features ----
+    # ----------------- BVP features -------------------
     bvp_std = std(bvp)
     add(bvp_std, "bvp_std")
     add(skew(bvp), "bvp_skew")
@@ -158,16 +212,16 @@ def extract_features(X, cols):
     add(extrema(bvp), "bvp_extrema")
     add(entropy_proxy(bvp), "bvp_entropy")
 
-    vpg = np.diff(bvp, axis=1)
-    apg = np.diff(vpg, axis=1)
+    vpg = np.diff(bvp, axis=1)          # first derivative
+    apg = np.diff(vpg, axis=1)          # second derivative
     vpg_std = std(vpg)
     apg_std = std(apg)
 
     add(vpg_std / (bvp_std + 1e-7), "bvp_hjorth_mobility")
     add((apg_std / (vpg_std + 1e-7)) /
-        (vpg_std / (bvp_std + 1e-7) + 1e-7),
-        "bvp_hjorth_complexity")
+        (vpg_std / (bvp_std + 1e-7) + 1e-7), "bvp_hjorth_complexity")
 
+    # Autocorrelation at physiologically plausible heart rates
     bpm_targets = [50, 60, 70, 80, 90, 100, 110, 120, 130, 140, 150, 170]
     lags = [int(60 * 64 / bpm) for bpm in bpm_targets]
     ac = ac_many(bvp, lags)
@@ -185,14 +239,15 @@ def extract_features(X, cols):
     add(kurt(apg), "apg_kurt")
     add(extrema(apg), "apg_extrema")
 
-    bpm_zc = (np.sum((vpg[:, :-1] <= 0) & (vpg[:, 1:] > 0), axis=1) * 6.0).astype(np.float32)
+    # BPM from zero crossings of derivative
+    bpm_zc = (np.sum((vpg[:, :-1] <= 0) & (vpg[:, 1:] > 0), axis=1) * 6.0).astype(np.float64)
     add(bpm_zc, "vpg_est_bpm")
     add(peak_count(bvp) * 6.0, "bvp_peak_bpm")
 
-    # additional robust BVP features
+    # Robust BVP statistics
     add(np.max(bvp, axis=1) - np.min(bvp, axis=1), "bvp_range")
-    add(np.percentile(bvp, 75, axis=1).astype(np.float32) -
-        np.percentile(bvp, 25, axis=1).astype(np.float32), "bvp_iqr")
+    add(np.percentile(bvp, 75, axis=1).astype(np.float64) -
+        np.percentile(bvp, 25, axis=1).astype(np.float64), "bvp_iqr")
     med = np.median(bvp, axis=1, keepdims=True)
     add(np.median(np.abs(bvp - med), axis=1), "bvp_mad")
     add(np.sqrt(np.mean(bvp ** 2, axis=1)), "bvp_rms")
@@ -203,11 +258,13 @@ def extract_features(X, cols):
     add(rr_std, "bvp_rr_std")
     add(rr_rmssd, "bvp_rr_rmssd")
     add(rr_median, "bvp_rr_median")
-    hr_from_rr = np.divide(60000.0, rr_mean,out=np.zeros_like(rr_mean),where=rr_mean > 0).astype(np.float32)
+    hr_from_rr = np.divide(60000.0, rr_mean,
+                           out=np.zeros_like(rr_mean),
+                           where=rr_mean > 0).astype(np.float64)
     add(hr_from_rr, "bvp_hr_from_rr")
 
-    # ---- Accelerometer features ----
-    acc_sq = ax ** 2 + ay ** 2 + az ** 2
+    # ----------------- Accelerometer features -----------------
+    acc_sq = ax**2 + ay**2 + az**2
     add(sma(ax, ay, az), "acc_sma")
     add(std(acc_sq), "acc_sq_std")
     add(tkeo(ax) + tkeo(ay) + tkeo(az), "acc_tkeo")
@@ -222,7 +279,7 @@ def extract_features(X, cols):
         add(skew(arr), f"acc_{name}_skew")
         add(kurt(arr), f"acc_{name}_kurt")
 
-    # ---- EDA features ----
+    # ----------------- EDA features -----------------
     add(mean(eda), "eda_mean")
     add(std(eda), "eda_std")
     add(std(np.diff(eda, axis=1)), "eda_diff_std")
@@ -234,7 +291,7 @@ def extract_features(X, cols):
     add(kurt(eda), "eda_kurt")
     add(mean(np.diff(eda, axis=1)), "eda_diff_mean")
 
-    # ---- Temporal context ----
+    # ----------------- Temporal context -----------------
     hb = bvp.shape[1] // 2
     ha = ax.shape[1] // 2
     add(std(bvp[:, :hb]), "bvp_std_h1")
@@ -243,74 +300,49 @@ def extract_features(X, cols):
     add(sma(ax[:, ha:], ay[:, ha:], az[:, ha:]), "acc_sma_h2")
     add(std(bvp[:, hb:]) / (std(bvp[:, :hb]) + 1e-7), "bvp_std_ratio_h2h1")
     add(sma(ax[:, ha:], ay[:, ha:], az[:, ha:]) /
-        (sma(ax[:, :ha], ay[:, :ha], az[:, :ha]) + 1e-7),
-        "acc_sma_ratio_h2h1")
+        (sma(ax[:, :ha], ay[:, :ha], az[:, :ha]) + 1e-7), "acc_sma_ratio_h2h1")
 
-    # ---- Per-block aggregate features ----
-    # BVP: reshape to (n, 10, 64)
+    # ----------------- Per‑block aggregates -----------------
     bvp_blocks = bvp.reshape(bvp.shape[0], 10, 64)
     bvp_block_std = np.std(bvp_blocks, axis=2)
     add(np.mean(bvp_block_std, axis=1), "bvp_block_std_mean")
     add(np.std(bvp_block_std, axis=1), "bvp_block_std_std")
 
-    # Accelerometer: stack axes and reshape to (n, 10, 32, 3)
-    acc = np.stack([ax, ay, az], axis=2)  # (n, 320, 3)
+    acc = np.stack([ax, ay, az], axis=2)
     acc_blocks = acc.reshape(acc.shape[0], 10, 32, 3)
     acc_block_sma = np.sum(np.abs(acc_blocks), axis=(2, 3))
     add(np.mean(acc_block_sma, axis=1), "acc_block_sma_mean")
     add(np.std(acc_block_sma, axis=1), "acc_block_sma_std")
 
-    Z = np.column_stack(F).astype(np.float32)
+    Z = np.column_stack(F).astype(np.float64)
     if not np.all(np.isfinite(Z)):
         raise ValueError("Feature matrix contains NaN/Inf.")
     return Z, N
 
 # ------------------------------------------------------------
-# True Dynamic Polynomial Expansion (Arbitrary Degree)
+# Degree-2 polynomial expansion
 # ------------------------------------------------------------
-def polynomial_expand(Z, names, degree=2):
+def polynomial_expand_deg2(Z, names):
+    """
+    Creates terms: x_i, x_i*x_j (i <= j), x_i^2.
+    Total = p + p*(p+1)/2
+    """
     n, p = Z.shape
-
-    # Count total number of polynomial terms up to 'degree'
-    count = p
-    if degree >= 2:
-        for d in range(2, degree + 1):
-            count += comb(p + d - 1, d)
-
-    out = np.empty((n, count), dtype=np.float32)
-    out_names = []
-
-    # Degree 1 (base features)
+    count = p + p * (p + 1) // 2
+    out = np.empty((n, count), dtype=np.float64)
+    out_names = list(names)
     out[:, :p] = Z
-    out_names.extend(names)
-
     col = p
 
-    # Degree 2 up to 'degree'
-    if degree >= 2:
-        for d in range(2, degree + 1):
-            for combo in itertools.combinations_with_replacement(range(p), d):
-                # Compute polynomial term directly into preallocated column
-                out[:, col] = np.prod(
-                    Z[:, list(combo)],
-                    axis=1,
-                    dtype=np.float32
-                )
-
-                counts = Counter(combo)
-                name_parts = []
-                for idx, count in counts.items():
-                    if count == 1:
-                        name_parts.append(names[idx])
-                    else:
-                        name_parts.append(f"{names[idx]}^{count}")
-                out_names.append("*".join(name_parts))
-
-                col += 1
+    for i in range(p):
+        zi = Z[:, i]
+        for j in range(i, p):
+            out[:, col] = zi * Z[:, j]
+            out_names.append(f"{names[i]}^2" if i == j else f"{names[i]}*{names[j]}")
+            col += 1
 
     if not np.all(np.isfinite(out)):
-        raise ValueError("Poly matrix contains NaN/Inf.")
-
+        raise ValueError("Polynomial matrix contains NaN/Inf.")
     return out, out_names
 
 # ------------------------------------------------------------
@@ -322,17 +354,17 @@ def main():
 
     train_path, test_path, pred_path = sys.argv[1:4]
     total = time.perf_counter()
-    sec("PART (C) — IMPROVED PIPELINE")
+    sec("PART (C) — PIPELINE WITH NO CV LEAKAGE")
 
     # 1. Load training data
     t = time.perf_counter()
     print("[1/6] Loading training data...")
-    df = pd.read_csv(train_path, dtype=np.float32)
+    df = pd.read_csv(train_path, dtype=np.float64)
     cols = [c for c in df.columns if c != "hr"]
     if len(cols) != RAW_FEATURES:
         raise ValueError(f"Expected {RAW_FEATURES} raw features, got {len(cols)}")
     y = df["hr"].to_numpy(dtype=np.float64)
-    X = df[cols].to_numpy(dtype=np.float32)
+    X = df[cols].to_numpy(dtype=np.float64)
     del df
     print(f"    samples={len(y):,}, raw_features={X.shape[1]}")
     print(f"    done in {time.perf_counter()-t:.2f}s")
@@ -344,103 +376,105 @@ def main():
     del X
     print(f"    base_features={Z.shape[1]}")
 
-    # Supervised pre-selection (Non-Linear Entropy Filter)
-    if BASE_SELECT_K is not None and BASE_SELECT_K < Z.shape[1]:
-        # Swapped f_regression for mutual_info_regression
-        select_k = SelectKBest(
-            score_func=partial(mutual_info_regression, n_jobs=4, random_state=RANDOM_STATE),
-            k=BASE_SELECT_K
-        )
-        Z = select_k.fit_transform(Z, y)
-        selected_idx = select_k.get_support(indices=True)
-        names = [names[i] for i in selected_idx]
-        print(f"    after SelectKBest(k={BASE_SELECT_K}) base_features={Z.shape[1]}")
-
-    Z, poly_names = polynomial_expand(Z, names, degree=POLY_DEGREE)
-    print(f"    expanded_features={Z.shape[1]}")
+    # Degree-2 polynomial expansion
+    Z_poly, poly_names = polynomial_expand_deg2(Z, names)
+    del Z
+    print(f"    expanded_features={Z_poly.shape[1]}")
     print(f"    done in {time.perf_counter()-t:.2f}s")
 
-    # 3. Scaling + Lasso selection (with precompute=True)
+    # 3. Build leak-free Pipeline
+    #    The pipeline applies scaler, Lasso selection, and SGD model
+    #    inside each CV fold. This prevents feature selection and scaling
+    #    from seeing validation targets.
     t = time.perf_counter()
-    print("\n[3/6] Scaling + Lasso selection...")
-    scaler = StandardScaler()
-    Z = scaler.fit_transform(Z)
+    print("\n[3/6] Creating Pipeline + GridSearchCV...")
 
     selector = SelectFromModel(
-        Lasso(
-            alpha=LASSO_ALPHA,
-            max_iter=LASSO_MAX_ITER,
-            tol=LASSO_TOL,
-            random_state=RANDOM_STATE,
-            precompute=True
-        ),
+        Lasso(alpha=LASSO_ALPHA,
+              max_iter=LASSO_MAX_ITER,
+              tol=LASSO_TOL,
+              random_state=RANDOM_STATE),
         max_features=LASSO_MAX_FEATURES,
         threshold=-np.inf
     )
-    Z = selector.fit_transform(Z, y)
-    print(f"    selected_features={Z.shape[1]}")
-    print(f"    done in {time.perf_counter()-t:.2f}s")
 
-    # 4. Direct final linear model (no grid search)
-    t = time.perf_counter()
-    print("\n[4/6] Fitting final SGD model...")
-    model = SGDRegressor(
-        loss="epsilon_insensitive",
-        penalty="l2",
-        alpha=0.0001,
-        epsilon=0.2,
-        max_iter=2000,
-        random_state=RANDOM_STATE
+    pipe = Pipeline([
+        ("scaler", StandardScaler()),
+        ("selector", selector),
+        ("model", SGDRegressor(
+            loss="epsilon_insensitive",
+            penalty="l2",
+            max_iter=2000,
+            random_state=RANDOM_STATE
+        ))
+    ])
+
+    # Grid search for final SGD hyperparameters
+    param_grid = {
+        "model__alpha": SGD_ALPHAS,
+        "model__epsilon": SGD_EPSILONS
+    }
+
+    grid = GridSearchCV(
+        pipe,
+        param_grid,
+        scoring="neg_mean_absolute_error",
+        cv=KFold(n_splits=CV_FOLDS, shuffle=True, random_state=RANDOM_STATE),
+        n_jobs=4,
+        pre_dispatch=4,
+        verbose=1
     )
-    model.fit(Z, y)
-    print(f"    alpha={model.alpha}, epsilon={model.epsilon}")
+
+    grid.fit(Z_poly, y)
+
+    # Best model is the full pipeline (scaler + selector + SGD)
+    best_pipe = grid.best_estimator_
+    cv_mae = -grid.best_score_
+    print(f"    best_params={grid.best_params_}")
+    print(f"    CV_MAE={cv_mae:.6f}")
     print(f"    done in {time.perf_counter()-t:.2f}s")
 
-    # Training diagnostics
-    pred = model.predict(Z)
+    # 4. Training diagnostics (optional)
+    t = time.perf_counter()
+    print("\n[4/6] Training diagnostics...")
+    pred_train = best_pipe.predict(Z_poly)
     mean_y = y.mean()
-    train_nmae = np.abs(y - pred).sum() / np.abs(y - mean_y).sum()
-    train_nmse = ((y - pred) ** 2).sum() / ((y - mean_y) ** 2).sum()
+    train_nmae = np.abs(y - pred_train).sum() / np.abs(y - mean_y).sum()
+    train_nmse = ((y - pred_train) ** 2).sum() / ((y - mean_y) ** 2).sum()
     print(f"    train_NMAE={train_nmae:.6f}")
     print(f"    train_NMSE={train_nmse:.6f}")
-    del pred, Z, y
-
-    # 5. Test feature extraction
-    t = time.perf_counter()
-    print("\n[5/6] Processing test data...")
-    df = pd.read_csv(test_path, dtype=np.float32)
-    X = df[cols].to_numpy(dtype=np.float32)
-    del df
-
-    Z_test, _ = extract_features(X, cols)
-    del X
-
-    if BASE_SELECT_K is not None and BASE_SELECT_K < Z_test.shape[1]:
-        Z_test = select_k.transform(Z_test)
-
-    Z_test, _ = polynomial_expand(Z_test, names, degree=POLY_DEGREE)
-    Z_test = selector.transform(scaler.transform(Z_test))
-    print(f"    test_samples={Z_test.shape[0]:,}")
-    print(f"    final_features={Z_test.shape[1]}")
     print(f"    done in {time.perf_counter()-t:.2f}s")
 
-    # 6. Predict
+    # 5. Test feature extraction and prediction
     t = time.perf_counter()
-    print("\n[6/6] Generating predictions...")
-    pred = model.predict(Z_test)
+    print("\n[5/6] Processing test data...")
+    df = pd.read_csv(test_path, dtype=np.float64)
+    X_test = df[cols].to_numpy(dtype=np.float64)
+    del df
+
+    Z_test, _ = extract_features(X_test, cols)
+    del X_test
+    Z_test_poly, _ = polynomial_expand_deg2(Z_test, names)
+    del Z_test
+
+    # The pipeline handles scaling, selection, and prediction on test
+    pred = best_pipe.predict(Z_test_poly)
+
     if not np.all(np.isfinite(pred)):
         raise ValueError("Predictions contain NaN/Inf.")
     np.savetxt(pred_path, pred, fmt="%.10f")
+    print(f"    test_samples={Z_test_poly.shape[0]:,}")
+    print(f"    final_features={best_pipe.named_steps['selector'].get_support().sum()}")
     print(f"    saved={len(pred):,}")
     print(f"    file={pred_path}")
     print(f"    done in {time.perf_counter()-t:.2f}s")
 
     # Summary
     sec("FINAL SUMMARY")
-    print(f"Base features after selection: {len(names)}")
+    print(f"Base features                 : {len(names)}")
     print(f"Expanded features             : {len(poly_names)}")
-    print(f"Selected features             : {Z_test.shape[1]}")
-    print(f"Best parameters               : {model.get_params()}")
+    print(f"Best parameters               : {grid.best_params_}")
+    print(f"CV MAE                        : {cv_mae:.6f}")
     print(f"Train NMAE                    : {train_nmae:.6f}")
     print(f"Train NMSE                    : {train_nmse:.6f}")
     print(f"Total runtime                 : {time.perf_counter()-total:.2f}s")
