@@ -1,4 +1,4 @@
-%%writefile src/part_c.py
+# %%writefile src/part_c.py
 import sys
 import time
 import warnings
