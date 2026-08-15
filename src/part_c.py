@@ -24,11 +24,11 @@ RANDOM_STATE = 42
 LASSO_ALPHA = 0.001
 LASSO_MAX_ITER = 3000
 LASSO_TOL = 1e-4
-SUBSAMPLE_SIZE = 50_000            # rows used for Lasso feature selection
+SUBSAMPLE_SIZE = 100_000            # rows used for Lasso feature selection
 
 # SGDRegressor (Linear MAE Optimization) Tuning Grid
 CV_FOLDS = 3
-SGD_ALPHAS = [1e-4, 1e-3, 1e-2, 1e-1, 1.0]
+SGD_ALPHAS = [0.0, 1e-6, 1e-5, 1e-4, 1e-2, 1.0]
 
 # ============================================================
 # Output helpers
@@ -150,6 +150,7 @@ def extract_base_features(X_raw, feature_columns):
     acc_y = X_raw[:, [i for i, c in enumerate(feature_columns) if c.startswith("acc_y_")]]
     acc_z = X_raw[:, [i for i, c in enumerate(feature_columns) if c.startswith("acc_z_")]]
     bvp = X_raw[:, [i for i, c in enumerate(feature_columns) if c.startswith("bvp_")]]
+    eda = X_raw[:, [i for i, c in enumerate(feature_columns) if c.startswith("eda_")]]
 
     vpg = np.diff(bvp, axis=1)
     apg = np.diff(vpg, axis=1)
@@ -259,6 +260,41 @@ def extract_base_features(X_raw, feature_columns):
     features.append(row_autocorr_lag(acc_mag, 16)); names.append("acc_ac_16")
     features.append(row_autocorr_lag(acc_mag, 32)); names.append("acc_ac_32")
     features.append(row_shannon_entropy(acc_mag)); names.append("acc_entropy")
+
+    # --------------------------------------------------------
+    # III. ELECTRODERMAL ACTIVITY (EDA) FEATURES
+    # --------------------------------------------------------
+    # 1. Tonic Baseline Envelopes
+    features.append(row_mean(eda)); names.append("eda_mean")
+    features.append(row_std(eda)); names.append("eda_std")
+    features.append(np.min(eda, axis=1)); names.append("eda_min")
+    features.append(np.max(eda, axis=1)); names.append("eda_max")
+    features.append(row_percentile(eda, 75) - row_percentile(eda, 25)); names.append("eda_iqr")
+    
+    # 2. Dynamic Trend (Slope Proxy)
+    eda_start_mean = np.mean(eda[:, :10], axis=1)
+    eda_end_mean = np.mean(eda[:, -10:], axis=1)
+    features.append(eda_end_mean - eda_start_mean); names.append("eda_slope_proxy")
+    
+    # 3. High-Frequency Neural Jitter
+    features.append(np.sum(np.abs(np.diff(eda, axis=1)), axis=1)); names.append("eda_line_length")
+    features.append(row_zero_crossings(np.diff(eda, axis=1))); names.append("eda_diff_zcross")
+
+    # 4. Phasic Skin Conductance Response (Spikes)
+    window = 8
+    cs = np.cumsum(eda, axis=1, dtype=np.float32)
+    tonic = (cs[:, window:] - cs[:, :-window]) / window
+    phasic = eda[:, window:] - tonic
+    
+    features.append(np.sum(phasic**2, axis=1)); names.append("eda_phasic_energy")
+    features.append(np.max(phasic, axis=1)); names.append("eda_phasic_max")
+    features.append(np.std(phasic, axis=1)); names.append("eda_phasic_std")
+    
+    # 5. Peak Impact & Morphological Shape
+    features.append(row_skewness(eda)); names.append("eda_skew")
+    features.append(row_kurtosis(eda)); names.append("eda_kurt")
+    features.append((np.argmax(eda, axis=1) / 40.0).astype(np.float32)); names.append("eda_peak_time")
+    features.append(row_rms(eda)); names.append("eda_rms")
 
     Z_base = np.column_stack(features).astype(np.float32)
     return Z_base, names
