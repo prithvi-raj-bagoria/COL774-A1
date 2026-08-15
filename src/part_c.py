@@ -1,9 +1,13 @@
 import sys, time
 import numpy as np
 import pandas as pd
+import itertools
+from math import comb
+from collections import Counter
+from functools import partial
 from sklearn.preprocessing import StandardScaler
 from sklearn.linear_model import Lasso, SGDRegressor
-from sklearn.feature_selection import SelectFromModel, SelectKBest, f_regression
+from sklearn.feature_selection import SelectFromModel, SelectKBest, mutual_info_regression
 from sklearn.model_selection import GridSearchCV, KFold
 
 # ------------------------------------------------------------
@@ -12,11 +16,11 @@ from sklearn.model_selection import GridSearchCV, KFold
 RAW_FEATURES = 1640
 LASSO_ALPHA = 0.005
 LASSO_MAX_ITER = 1000
-LASSO_TOL = 1e-2          # relaxed for speed
+LASSO_TOL = 1e-3          # relaxed for speed
 CV_FOLDS = 3
-POLY_DEGREE = 2
+POLY_DEGREE = 3
 RANDOM_STATE = 42
-BASE_SELECT_K = 100      # no selection if base features < this
+BASE_SELECT_K = 50      # no selection if base features < this
 LASSO_MAX_FEATURES = 1000
 SGD_ALPHAS = [1e-5, 1e-4, 1e-3, 1e-2]     # expanded grid
 SGD_EPSILONS = [0.01, 0.1, 0.2, 0.5, 1]
@@ -262,27 +266,50 @@ def extract_features(X, cols):
     return Z, N
 
 # ------------------------------------------------------------
-# Polynomial expansion (degree 2)
+# True Dynamic Polynomial Expansion (Arbitrary Degree)
 # ------------------------------------------------------------
 def polynomial_expand(Z, names, degree=2):
     n, p = Z.shape
+
+    # Count total number of polynomial terms up to 'degree'
     count = p
     if degree >= 2:
-        count += p * (p + 1) // 2
+        for d in range(2, degree + 1):
+            count += comb(p + d - 1, d)
 
     out = np.empty((n, count), dtype=np.float32)
-    out_names = list(names)
+    out_names = []
+
+    # Degree 1 (base features)
     out[:, :p] = Z
+    out_names.extend(names)
+
     col = p
 
+    # Degree 2 up to 'degree'
     if degree >= 2:
-        for i in range(p):
-            zi = Z[:, i]
-            for j in range(i, p):
-                out[:, col] = zi * Z[:, j]
-                out_names.append(f"{names[i]}^2" if i == j
-                                 else f"{names[i]}*{names[j]}")
+        for d in range(2, degree + 1):
+            for combo in itertools.combinations_with_replacement(range(p), d):
+                # Compute polynomial term directly into preallocated column
+                out[:, col] = np.prod(
+                    Z[:, list(combo)],
+                    axis=1,
+                    dtype=np.float32
+                )
+
+                counts = Counter(combo)
+                name_parts = []
+                for idx, count in counts.items():
+                    if count == 1:
+                        name_parts.append(names[idx])
+                    else:
+                        name_parts.append(f"{names[idx]}^{count}")
+                out_names.append("*".join(name_parts))
+
                 col += 1
+
+    if not np.all(np.isfinite(out)):
+        raise ValueError("Poly matrix contains NaN/Inf.")
 
     return out, out_names
 
@@ -317,9 +344,13 @@ def main():
     del X
     print(f"    base_features={Z.shape[1]}")
 
-    # Supervised pre-selection (only if base features > K)
+    # Supervised pre-selection (Non-Linear Entropy Filter)
     if BASE_SELECT_K is not None and BASE_SELECT_K < Z.shape[1]:
-        select_k = SelectKBest(f_regression, k=BASE_SELECT_K)
+        # Swapped f_regression for mutual_info_regression
+        select_k = SelectKBest(
+            score_func=partial(mutual_info_regression, n_jobs=4, random_state=RANDOM_STATE),
+            k=BASE_SELECT_K
+        )
         Z = select_k.fit_transform(Z, y)
         selected_idx = select_k.get_support(indices=True)
         names = [names[i] for i in selected_idx]
