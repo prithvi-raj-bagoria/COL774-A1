@@ -64,7 +64,7 @@ eval_part_c:
 	@cp "$(C_DATA_DIR)/val.csv" "$(C_DATA_DIR)/temp_eval/test.csv"
 	$(PYTHON) part_c.py "$(C_DATA_DIR)/temp_eval" model.pkl val_features_for_eval.csv
 	$(PYTHON) "$(DATA_DIR)/Assingment 1.2 Files/evaluate_partc.py" "$(C_DATA_DIR)/temp_eval/test.csv" model.pkl val_features_for_eval.csv
-	@rm -rf "$(C_DATA_DIR)/temp_eval" val_features_for_eval.csv
+
 
 kaggle_part_c:
 	@echo "================================================================"
